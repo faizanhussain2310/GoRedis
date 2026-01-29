@@ -668,8 +668,204 @@ Master → Replica: *3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n
 Master → Replica: *3\r\n$3\r\nDEL\r\n$3\r\nkey\r\n...
 ```
 
+### Connection Resilience & Keepalive Mechanisms
+
+Our implementation uses **multiple layers** of timeout and keepalive mechanisms to ensure reliable replication even in unstable network conditions:
+
+#### 1. TCP Keepalive (OS Level)
+
+**Location:** `internal/replication/replica.go:47-51`
+
+```go
+if tcpConn, ok := conn.(*net.TCPConn); ok {
+    tcpConn.SetKeepAlive(true)
+    tcpConn.SetKeepAlivePeriod(30 * time.Second)
+}
+```
+
+**Purpose:**
+- Detects network/hardware failures at the OS level
+- Sends TCP probe packets every 30 seconds when connection is idle
+- If peer doesn't respond after ~9 probes (270s), OS closes the socket
+- Handles scenarios: cable unplugged, router failure, host crash
+
+**Detection Time:** 30-90 seconds
+
+#### 2. Read Deadline (Application Level)
+
+**Location:** `internal/replication/replica.go:224-227`
+
+```go
+// Set read deadline to prevent infinite blocking
+conn.SetReadDeadline(time.Now().Add(65 * time.Second))
+```
+
+**Purpose:**
+- Prevents infinite blocking if master goes silent (hung/frozen process)
+- Deadline is reset on every successful read
+- If 65 seconds pass with no data, read returns timeout error
+- Triggers automatic reconnection
+
+**Detection Time:** 65 seconds of silence
+
+**Why 65 seconds?**
+- Slightly longer than Redis's default `repl-timeout` (60s)
+- Gives master time to send keepalive messages
+- Short enough to detect problems quickly
+
+#### 3. Application Heartbeat (REPLCONF ACK)
+
+**Location:** `internal/replication/replica.go:380-406`
+
+```go
+func (rm *ReplicationManager) sendReplicationHeartbeat() {
+    ticker := time.NewTicker(1 * time.Second)
+    defer ticker.Stop()
+    
+    for range ticker.C {
+        offset := rm.masterInfo.Offset
+        cmd := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$%d\r\n%d\r\n", 
+                          len(offsetStr), offset)
+        rm.sendToMaster(cmd)
+    }
+}
+```
+
+**Purpose:**
+- Sends `REPLCONF ACK <offset>` to master every 1 second
+- Proves replica is alive and processing commands
+- Master can track replica lag and offset
+- Keeps connection active (prevents timeout)
+
+**Benefits:**
+- Real-time lag monitoring
+- Early detection of slow/stuck replicas
+- Enables master to make informed failover decisions
+
+#### 4. PING/PONG Handling
+
+**Location:** `internal/replication/replica.go:318-337`
+
+```go
+// Handle special replication commands
+if cmdName == "PING" {
+    rm.sendToMaster("+PONG\r\n")
+    continue
+}
+
+if cmdName == "REPLCONF" && args[1] == "GETACK" {
+    offset := rm.masterInfo.Offset
+    resp := fmt.Sprintf("REPLCONF ACK %d", offset)
+    rm.sendToMaster(resp)
+    continue
+}
+```
+
+**Purpose:**
+- Responds to master's PING commands (master-initiated keepalive)
+- Responds to REPLCONF GETACK (master asking for offset)
+- Bi-directional health checking
+
+#### 5. Auto-Reconnect
+
+**Location:** `internal/replication/replica.go:345-366`
+
+```go
+func (rm *ReplicationManager) handleMasterDisconnect() {
+    // Mark as disconnected
+    rm.masterInfo.State = MasterStateDisconnected
+    
+    // Auto-reconnect after 5 seconds
+    go func() {
+        time.Sleep(5 * time.Second)
+        log.Printf("Attempting to reconnect to master %s:%d", host, port)
+        rm.ConnectToMaster(host, port)
+    }()
+}
+```
+
+**Purpose:**
+- Automatic recovery from transient failures
+- Resilient to temporary network issues
+- Continuous retry until reconnection succeeds
+
+**Reconnect Strategy:**
+1. Detect disconnect (any of the above mechanisms)
+2. Wait 5 seconds (avoid connection storms)
+3. Attempt full reconnection (handshake + PSYNC)
+4. If fails, repeat from step 2
+
+### How These Mechanisms Work Together
+
+```
+Timeline of Connection Monitoring:
+═══════════════════════════════════════════════════════════════════
+
+0s      Connection established
+        ├─ TCP keepalive enabled (30s period)
+        ├─ Read deadline set (65s)
+        └─ Heartbeat started (1s interval)
+
+1s      → REPLCONF ACK 0
+2s      → REPLCONF ACK 0
+3s      ← SET key val (replica executes, offset → 45)
+4s      → REPLCONF ACK 45
+...
+30s     ← OS TCP keepalive probe sent
+        └─ Master responds (connection alive ✓)
+
+─── Master process freezes here (hung, not crashed) ───
+
+31s     → REPLCONF ACK 45 (master doesn't respond)
+32s     → REPLCONF ACK 45 (master doesn't respond)
+...     (heartbeats continue, no data received)
+
+60s     ← OS TCP keepalive probe sent
+        └─ Connection still open at TCP level
+
+65s     ⚠️  Read deadline exceeded!
+        └─→ read() returns: i/o timeout
+        └─→ handleMasterDisconnect() called
+        └─→ Connection closed
+        └─→ Wait 5 seconds...
+
+70s     → Attempt reconnection to master
+```
+
+### Failure Scenarios & Detection
+
+| Failure Type | Detection Method | Time to Detect | Recovery |
+|--------------|------------------|----------------|----------|
+| Master process crash | TCP FIN/RST | Immediate | Auto-reconnect (5s) |
+| Master process hung | Read deadline | 65 seconds | Auto-reconnect (5s) |
+| Network cable unplugged | TCP keepalive | 30-90s | Auto-reconnect (5s) |
+| Network partition | Read deadline | 65 seconds | Auto-reconnect (5s) |
+| Slow network | REPLCONF ACK lag | 1s (master notices) | Master can take action |
+| Master restart | Read error | Immediate | Auto-reconnect (5s) |
+
+### Configuration Options
+
+```go
+// Timeout constants (can be made configurable)
+const (
+    TCPKeepalivePeriod    = 30 * time.Second  // OS-level keepalive
+    ReplicationTimeout    = 65 * time.Second  // Read deadline
+    HeartbeatInterval     = 1 * time.Second   // REPLCONF ACK frequency
+    ReconnectDelay        = 5 * time.Second   // Wait before reconnect
+)
+```
+
+### Best Practices
+
+1. **Monitor replica lag**: Use `INFO REPLICATION` to check offset differences
+2. **Set alerts**: If replica is down for >1 minute, investigate
+3. **Network stability**: Ensure low latency between master and replicas (<10ms ideal)
+4. **Avoid overloading**: Too many replicas can slow down master
+5. **Use read replicas**: Distribute read load across replicas
+
 ## References
 
 - [Redis Replication Documentation](https://redis.io/docs/manual/replication/)
 - [PSYNC Protocol Spec](https://redis.io/commands/psync/)
 - [RDB File Format](https://rdb.fnordig.de/file_format.html)
+- [TCP Keepalive Guide](https://tldp.org/HOWTO/TCP-Keepalive-HOWTO/)

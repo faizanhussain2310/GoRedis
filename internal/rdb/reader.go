@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc64"
 	"io"
+	"math"
 	"os"
 	"time"
 )
@@ -16,10 +17,13 @@ const (
 	opExpireTime   = OpCodeExpireTime
 	opExpireTimeMs = OpCodeExpireTimeMS
 
-	typeString = TypeString
-	typeList   = TypeList
-	typeHash   = TypeHash
-	typeSet    = TypeSet
+	typeString      = TypeString
+	typeList        = TypeList
+	typeSet         = TypeSet
+	typeZSet        = TypeZSet
+	typeHash        = TypeHash
+	typeBloomFilter = TypeBloomFilter
+	typeHyperLogLog = TypeHyperLogLog
 )
 
 // Reader handles reading RDB files
@@ -147,7 +151,7 @@ func (r *Reader) Load() ([]LoadCommand, error) {
 
 			return commands, nil
 
-		case typeString, typeList, typeHash, typeSet:
+		case typeString, typeList, typeHash, typeSet, typeZSet:
 			// Read key-value pair
 			key, keyBytes, err := r.readString()
 			if err != nil {
@@ -168,6 +172,8 @@ func (r *Reader) Load() ([]LoadCommand, error) {
 				value, valueBytes, err = r.readHash()
 			case typeSet:
 				value, valueBytes, err = r.readSet()
+			case typeZSet:
+				value, valueBytes, err = r.readZSet()
 			}
 
 			if err != nil {
@@ -184,6 +190,16 @@ func (r *Reader) Load() ([]LoadCommand, error) {
 
 			// Reset expiration for next key
 			currentExpiration = nil
+
+		case typeBloomFilter:
+			// BloomFilter not supported in RDB load - skip this entry
+			// Would require implementing readBloomFilter() method
+			return nil, fmt.Errorf("BloomFilter type not supported in RDB restore")
+
+		case typeHyperLogLog:
+			// HyperLogLog not supported in RDB load - skip this entry
+			// Would require implementing readHyperLogLog() method
+			return nil, fmt.Errorf("HyperLogLog type not supported in RDB restore")
 
 		default:
 			return nil, fmt.Errorf("unknown type byte: %d", typeByte)
@@ -278,6 +294,47 @@ func (r *Reader) readSet() (map[string]struct{}, []byte, error) {
 	}
 
 	return set, allBytes, nil
+}
+
+// ZSetMember represents a sorted set member with score (for RDB loading)
+type ZSetMember struct {
+	Member string
+	Score  float64
+}
+
+// readZSet reads a sorted set value
+func (r *Reader) readZSet() ([]ZSetMember, []byte, error) {
+	length, lengthBytes, err := r.readLength()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to read zset length: %w", err)
+	}
+
+	allBytes := lengthBytes
+	zset := make([]ZSetMember, length)
+	for i := uint32(0); i < length; i++ {
+		// Read member string
+		member, memberBytes, err := r.readString()
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to read zset member %d: %w", i, err)
+		}
+		allBytes = append(allBytes, memberBytes...)
+
+		// Read score (8-byte float64)
+		var score float64
+		if err := binary.Read(r.reader, binary.LittleEndian, &score); err != nil {
+			return nil, nil, fmt.Errorf("failed to read zset score %d: %w", i, err)
+		}
+		scoreBytes := make([]byte, 8)
+		binary.LittleEndian.PutUint64(scoreBytes, math.Float64bits(score))
+		allBytes = append(allBytes, scoreBytes...)
+
+		zset[i] = ZSetMember{
+			Member: member,
+			Score:  score,
+		}
+	}
+
+	return zset, allBytes, nil
 }
 
 // readLength reads a variable-length integer

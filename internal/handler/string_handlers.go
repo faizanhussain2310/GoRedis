@@ -218,3 +218,111 @@ func (h *CommandHandler) handleTTL(cmd *protocol.Command) []byte {
 	ttl := result.(int64)
 	return protocol.EncodeInteger(int(ttl))
 }
+
+func (h *CommandHandler) handleIncr(cmd *protocol.Command) []byte {
+	if len(cmd.Args) < 2 {
+		return protocol.EncodeError("ERR wrong number of arguments for 'incr' command")
+	}
+
+	key := cmd.Args[1]
+
+	procCmd := &processor.Command{
+		Type:     processor.CmdIncr,
+		Key:      key,
+		Response: make(chan interface{}, 1),
+	}
+	h.processor.Submit(procCmd)
+	result := <-procCmd.Response
+
+	res := result.(processor.Int64Result)
+	if res.Err != nil {
+		return protocol.EncodeError(fmt.Sprintf("ERR %v", res.Err))
+	}
+
+	return protocol.EncodeInteger(int(res.Result))
+}
+
+func (h *CommandHandler) handleIncrBy(cmd *protocol.Command) []byte {
+	if len(cmd.Args) < 3 {
+		return protocol.EncodeError("ERR wrong number of arguments for 'incrby' command")
+	}
+
+	key := cmd.Args[1]
+	increment := cmd.Args[2]
+
+	// Parse increment value
+	var inc int64
+	if _, err := fmt.Sscanf(increment, "%d", &inc); err != nil {
+		return protocol.EncodeError("ERR value is not an integer or out of range")
+	}
+
+	procCmd := &processor.Command{
+		Type:     processor.CmdIncrBy,
+		Key:      key,
+		Value:    inc,
+		Response: make(chan interface{}, 1),
+	}
+	h.processor.Submit(procCmd)
+	result := <-procCmd.Response
+
+	res := result.(processor.Int64Result)
+	if res.Err != nil {
+		return protocol.EncodeError(fmt.Sprintf("ERR %v", res.Err))
+	}
+
+	return protocol.EncodeInteger(int(res.Result))
+}
+
+func (h *CommandHandler) handleDecr(cmd *protocol.Command) []byte {
+	if len(cmd.Args) < 2 {
+		return protocol.EncodeError("ERR wrong number of arguments for 'decr' command")
+	}
+
+	key := cmd.Args[1]
+
+	procCmd := &processor.Command{
+		Type:     processor.CmdDecr,
+		Key:      key,
+		Response: make(chan interface{}, 1),
+	}
+	h.processor.Submit(procCmd)
+	result := <-procCmd.Response
+
+	res := result.(processor.Int64Result)
+	if res.Err != nil {
+		return protocol.EncodeError(fmt.Sprintf("ERR %v", res.Err))
+	}
+
+	return protocol.EncodeInteger(int(res.Result))
+}
+
+func (h *CommandHandler) handleDecrBy(cmd *protocol.Command) []byte {
+	if len(cmd.Args) < 3 {
+		return protocol.EncodeError("ERR wrong number of arguments for 'decrby' command")
+	}
+
+	key := cmd.Args[1]
+	decrement := cmd.Args[2]
+
+	// Parse decrement value
+	var dec int64
+	if _, err := fmt.Sscanf(decrement, "%d", &dec); err != nil {
+		return protocol.EncodeError("ERR value is not an integer or out of range")
+	}
+
+	procCmd := &processor.Command{
+		Type:     processor.CmdDecrBy,
+		Key:      key,
+		Value:    dec,
+		Response: make(chan interface{}, 1),
+	}
+	h.processor.Submit(procCmd)
+	result := <-procCmd.Response
+
+	res := result.(processor.Int64Result)
+	if res.Err != nil {
+		return protocol.EncodeError(fmt.Sprintf("ERR %v", res.Err))
+	}
+
+	return protocol.EncodeInteger(int(res.Result))
+}

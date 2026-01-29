@@ -2,14 +2,18 @@ package server
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"redis/internal/aof"
+	"redis/internal/cluster"
 	"redis/internal/handler"
 	"redis/internal/processor"
 	"redis/internal/protocol"
@@ -48,6 +52,15 @@ func NewRedisServer(cfg *Config) *RedisServer {
 	}
 
 	store := storage.NewStore()
+
+	// Initialize cluster if enabled
+	if cfg.ClusterEnabled {
+		if err := initializeCluster(cfg, store); err != nil {
+			log.Printf("Warning: Failed to initialize cluster: %v", err)
+			log.Printf("Continuing without cluster support")
+		}
+	}
+
 	proc := processor.NewProcessor(store)
 
 	// Create AOF writer
@@ -119,7 +132,8 @@ func NewRedisServer(cfg *Config) *RedisServer {
 	if replRole == replication.RoleReplica {
 		replMgr.SetCommandExecutor(func(args []string) error {
 			cmd := &protocol.Command{Args: args}
-			response := cmdHandler.ExecuteCommand(cmd)
+			// Use ExecuteReplicatedCommand which bypasses read-only check
+			response := cmdHandler.ExecuteReplicatedCommand(cmd)
 			// Check if response is an error
 			if len(response) > 0 && response[0] == '-' {
 				return fmt.Errorf("command failed: %s", string(response))
@@ -308,7 +322,7 @@ func (s *RedisServer) handleConnection(ctx context.Context, conn net.Conn) {
 	defer s.connections.Delete(connID)
 	defer conn.Close()
 
-	log.Printf("New connection [%d] from %s", connID, conn.RemoteAddr())
+	startTime := time.Now()
 
 	client := &handler.Client{
 		ID:   connID,
@@ -317,7 +331,12 @@ func (s *RedisServer) handleConnection(ctx context.Context, conn net.Conn) {
 
 	s.handler.Handle(ctx, client)
 
-	log.Printf("Connection [%d] closed", connID)
+	// Only log connections that lived longer than 2 seconds (persistent connections)
+	// This filters out Sentinel health check spam
+	duration := time.Since(startTime)
+	if duration > 2*time.Second {
+		log.Printf("Connection [%d] from %s closed after %v", connID, conn.RemoteAddr(), duration.Round(time.Second))
+	}
 }
 
 // Shutdown gracefully shuts down the server
@@ -385,4 +404,46 @@ func (s *RedisServer) Shutdown() {
 	}
 
 	log.Println("Redis server shutdown complete")
+}
+
+// initializeCluster sets up cluster mode for the server
+func initializeCluster(cfg *Config, store *storage.Store) error {
+	// Generate node ID if not provided
+	nodeID := cfg.ClusterNodeID
+	if nodeID == "" {
+		// Generate unique node ID based on host:port
+		hash := sha1.Sum([]byte(fmt.Sprintf("%s:%d:%d", cfg.Host, cfg.Port, time.Now().UnixNano())))
+		nodeID = hex.EncodeToString(hash[:])
+		log.Printf("Generated cluster node ID: %s", nodeID)
+	}
+
+	// Create cluster instance
+	clusterInstance := cluster.NewCluster(nodeID, cfg.Host, cfg.Port)
+
+	// Enable cluster mode
+	clusterInstance.Enable()
+
+	// Assign to store
+	store.Cluster = clusterInstance
+
+	log.Printf("Cluster mode enabled")
+	log.Printf("Cluster node ID: %s", nodeID)
+	log.Printf("Cluster address: %s:%d", cfg.Host, cfg.Port)
+	log.Printf("Cluster state: %s (no slots assigned yet)", clusterInstance.GetState())
+	log.Printf("")
+	log.Printf("To assign slots to this node, use:")
+	log.Printf("  CLUSTER ADDSLOTS <slot> [slot ...]")
+	log.Printf("  CLUSTER ADDSLOTS 0 1 2 ... 5460  (for 1/3 of slots)")
+	log.Printf("")
+
+	// Try to load cluster configuration from file
+	if cfg.ClusterConfig != "" {
+		if _, err := os.Stat(cfg.ClusterConfig); err == nil {
+			log.Printf("Loading cluster configuration from: %s", cfg.ClusterConfig)
+			// TODO: Implement cluster config file loading
+			log.Printf("Note: Cluster config file loading not yet implemented")
+		}
+	}
+
+	return nil
 }

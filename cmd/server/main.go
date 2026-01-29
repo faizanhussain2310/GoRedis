@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"os"
 	"os/signal"
@@ -13,12 +14,21 @@ import (
 )
 
 func main() {
+	// Parse command-line flags
+	port := flag.Int("port", 6379, "Port to listen on")
+	host := flag.String("host", "127.0.0.1", "Host to bind to")
+	replicationRole := flag.String("replication-role", "master", "Replication role (master/replica)")
+	replicationMasterHost := flag.String("replication-master-host", "", "Master host for replica")
+	replicationMasterPort := flag.Int("replication-master-port", 6379, "Master port for replica")
+	replicaPriority := flag.Int("replica-priority", 100, "Replica priority for failover")
+	flag.Parse()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	cfg := &server.Config{
-		Host:            "127.0.0.1",
-		Port:            6379,
+		Host:            *host,
+		Port:            *port,
 		MaxConnections:  10000,
 		ReadBufferSize:  4096,
 		WriteBufferSize: 4096,
@@ -26,9 +36,9 @@ func main() {
 		// Pipeline configuration
 		MaxPipelineCommands: 1000,
 		SlowLogThreshold:    10 * time.Millisecond, // 10 milliseconds
-		CommandTimeout:      5 * time.Second,       // 5 seconds
-		ReadTimeout:         5 * time.Second,       // 5 seconds
-		PipelineTimeout:     1 * time.Millisecond,  // 1 millisecond
+		CommandTimeout:      30 * time.Second,      // 30 seconds
+		ReadTimeout:         60 * time.Second,      // 60 seconds
+		PipelineTimeout:     1 * time.Second,       // 1 second
 
 		// AOF configuration
 		AOF: aof.Config{
@@ -46,8 +56,14 @@ func main() {
 		},
 
 		// Replication defaults
-		ReplicaPriority: 100,      // Default priority for failover
-		ReplicationRole: "master", // Default role is master
+		ReplicaPriority:       *replicaPriority,
+		ReplicationRole:       *replicationRole,
+		ReplicationMasterHost: *replicationMasterHost,
+		ReplicationMasterPort: *replicationMasterPort,
+
+		// Cluster defaults
+		ClusterEnabled: false,        // Cluster mode disabled by default
+		ClusterConfig:  "nodes.conf", // Default cluster config file
 	}
 
 	srv := server.NewRedisServer(cfg)

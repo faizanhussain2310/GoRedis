@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"redis/internal/cluster"
 	"sync/atomic"
 	"time"
 )
@@ -8,8 +9,9 @@ import (
 type Store struct {
 	data           map[string]*Value
 	dataWithExpiry map[string]time.Time
-	snapshotCount  int32   // Atomic counter for active snapshots (COW optimization)
-	PubSub         *PubSub // Publish/Subscribe manager
+	snapshotCount  int32            // Atomic counter for active snapshots (COW optimization)
+	PubSub         *PubSub          // Publish/Subscribe manager
+	Cluster        *cluster.Cluster // Cluster manager (nil if cluster mode disabled)
 }
 
 type Value struct {
@@ -27,6 +29,7 @@ const (
 	HashType
 	ZSetType
 	BloomFilterType
+	HyperLogLogType
 )
 
 func NewStore() *Store {

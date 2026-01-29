@@ -38,6 +38,11 @@ type Config struct {
 	ReplicationMasterHost string // Master host (if replica)
 	ReplicationMasterPort int    // Master port (if replica)
 	ReplicaPriority       int    // Priority for Sentinel failover (0-100, higher = preferred)
+
+	// Cluster configuration
+	ClusterEnabled bool   // Enable cluster mode
+	ClusterNodeID  string // Unique node ID (40-char hex, auto-generated if empty)
+	ClusterConfig  string // Path to cluster config file (nodes.conf)
 }
 
 func DefaultConfig() *Config {
@@ -51,9 +56,9 @@ func DefaultConfig() *Config {
 		// Pipeline defaults
 		MaxPipelineCommands: 1000,
 		SlowLogThreshold:    10 * time.Millisecond, // Log commands slower than 10ms
-		CommandTimeout:      5 * time.Second,       // Disconnect after 5s for a single command
-		ReadTimeout:         5 * time.Second,       // 5 second read timeout for partial commands
-		PipelineTimeout:     1 * time.Millisecond,  // Short timeout for waiting for in-flight pipelined commands
+		CommandTimeout:      30 * time.Second,      // Disconnect after 30s for a single command
+		ReadTimeout:         60 * time.Second,      // 60 second read timeout for partial commands
+		PipelineTimeout:     1 * time.Second,       // Short timeout for waiting for in-flight pipelined commands
 
 		// AOF defaults
 		AOF: aof.DefaultConfig(),
@@ -68,5 +73,9 @@ func DefaultConfig() *Config {
 		// Replication defaults
 		ReplicaPriority: 100,      // Default priority for failover
 		ReplicationRole: "master", // Default role is master
+
+		// Cluster defaults
+		ClusterEnabled: false,        // Cluster mode disabled by default
+		ClusterConfig:  "nodes.conf", // Default cluster config file
 	}
 }

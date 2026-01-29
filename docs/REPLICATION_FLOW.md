@@ -71,9 +71,17 @@ When you execute a write command on the master (e.g., `SET key "value"`), it aut
 │                      REPLICA SERVER(S)                                │
 │                                                                       │
 │  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │ 0. TCP Keepalive Setup (replica.go:47-51)                      │ │
+│  │    - Enable TCP keepalive on master connection                 │ │
+│  │    - Period: 30 seconds (OS-level dead connection detection)   │ │
+│  │    - Detects network/hardware failures automatically           │ │
+│  └──────────────────────────┬──────────────────────────────────────┘ │
+│                             ↓                                         │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
 │  │ 8. Receive Stream (replica.go:252)                             │ │
 │  │    receiveReplicationStream() goroutine is running              │ │
 │  │    - Continuously reads from master TCP connection              │ │
+│  │    - Read deadline: 65s (prevents infinite blocking)            │ │
 │  │    - Blocking read on reader.ReadString('\n')                  │ │
 │  └──────────────────────────┬──────────────────────────────────────┘ │
 │                             ↓                                         │
@@ -100,6 +108,14 @@ When you execute a write command on the master (e.g., `SET key "value"`), it aut
 │  ┌─────────────────────────────────────────────────────────────────┐ │
 │  │ 11. Update Offset (replica.go:301)                             │ │
 │  │     masterInfo.Offset++                                         │ │
+│  └─────────────────────────────────────────────────────────────────┘ │
+│                                                                       │
+│  ┌─────────────────────────────────────────────────────────────────┐ │
+│  │ 12. Heartbeat Goroutine (replica.go:380-406)                   │ │
+│  │     sendReplicationHeartbeat() running in background            │ │
+│  │     - Sends REPLCONF ACK <offset> every 1 second                │ │
+│  │     - Keeps connection alive                                    │ │
+│  │     - Master tracks replica lag via offset                      │ │
 │  └─────────────────────────────────────────────────────────────────┘ │
 │                                                                       │
 │  Now replica has: key = "value" ✅                                   │
@@ -256,6 +272,18 @@ if strings.HasPrefix(line, "*") {
     }
     
     // Result: args = ["SET", "key", "value"]
+    
+    // Handle special replication commands (replica.go:318-337)
+    if args[0] == "PING" {
+        // Respond to master's keepalive PING
+        rm.sendToMaster("+PONG\r\n")
+        continue
+    }
+    if args[0] == "REPLCONF" && args[1] == "GETACK" {
+        // Master asking for current offset
+        rm.sendToMaster(fmt.Sprintf("REPLCONF ACK %d", offset))
+        continue
+    }
 }
 ```
 
@@ -429,3 +457,146 @@ The replication stream is a **continuous, asynchronous, TCP-based** command prop
 3. ✅ **Replica:** Background goroutine → Reads TCP → Parses RESP → Executes locally
 
 It's like a **live command mirror** - every write on master instantly flows to replicas!
+
+## Connection Resilience & Timeout Mechanisms
+
+### Three Layers of Protection
+
+The replication connection uses multiple timeout mechanisms to ensure reliability:
+
+#### 1. TCP Keepalive (OS Level) - `replica.go:47-51`
+```go
+if tcpConn, ok := conn.(*net.TCPConn); ok {
+    tcpConn.SetKeepAlive(true)
+    tcpConn.SetKeepAlivePeriod(30 * time.Second)
+}
+```
+
+**What it does:**
+- OS sends TCP probe packets every 30 seconds when connection is idle
+- Detects network/hardware failures (cable unplugged, router failure)
+- If no response after ~9 probes (270s total), OS closes the socket
+- Next read/write returns error → triggers `handleMasterDisconnect()`
+
+**Detection time:** ~30-90 seconds for complete network failure
+
+#### 2. Read Deadline (Application Level) - `replica.go:224-227`
+```go
+// Set read deadline (65s - slightly longer than repl-timeout)
+conn.SetReadDeadline(time.Now().Add(65 * time.Second))
+```
+
+**What it does:**
+- Prevents infinite blocking if master goes silent (frozen, hung)
+- Deadline resets on every successful read
+- If 65 seconds pass with no data from master → read returns timeout error
+- Triggers automatic reconnection
+
+**Detection time:** 65 seconds of silence
+
+#### 3. Application Heartbeat (Redis Protocol) - `replica.go:380-406`
+```go
+func (rm *ReplicationManager) sendReplicationHeartbeat() {
+    ticker := time.NewTicker(1 * time.Second)
+    for range ticker.C {
+        // Send REPLCONF ACK <offset> every second
+        cmd := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$%d\r\n%s\r\n", 
+                          len(offsetStr), offsetStr)
+        rm.sendToMaster(cmd)
+    }
+}
+```
+
+**What it does:**
+- Sends `REPLCONF ACK <offset>` to master every 1 second
+- Master can track replica lag and health
+- Keeps connection active (prevents timeout)
+- Master can detect slow/stuck replicas
+
+**Benefit:** Real-time lag monitoring
+
+#### 4. PING/PONG Handling - `replica.go:318-337`
+```go
+if cmdName == "PING" {
+    rm.sendToMaster("+PONG\r\n")
+    continue
+}
+if cmdName == "REPLCONF" && args[1] == "GETACK" {
+    rm.sendToMaster(fmt.Sprintf("REPLCONF ACK %d", offset))
+    continue
+}
+```
+
+**What it does:**
+- Responds to master's PING commands (master-initiated keepalive)
+- Responds to REPLCONF GETACK (master asking for offset)
+- Proves replica is alive and processing commands
+
+#### 5. Auto-Reconnect - `replica.go:345-366`
+```go
+func (rm *ReplicationManager) handleMasterDisconnect() {
+    // Close connection, mark as disconnected
+    // ...
+    
+    // Auto-reconnect after 5 seconds
+    go func() {
+        time.Sleep(5 * time.Second)
+        rm.ConnectToMaster(host, port)
+    }()
+}
+```
+
+**What it does:**
+- Any disconnect triggers automatic reconnection after 5 seconds
+- Resilient to temporary network issues
+- Continues retrying until successful
+
+### Timeline: How Timeouts Work Together
+
+```
+Time    Activity
+────────────────────────────────────────────────────────────
+0s      Connection established
+        - TCP keepalive enabled (30s period)
+        - Read deadline set (65s)
+        - Heartbeat goroutine started (1s interval)
+
+1s      → Replica sends REPLCONF ACK 0
+2s      → Replica sends REPLCONF ACK 0  
+3s      ← Master sends: SET key val
+        ↳ Replica executes, updates offset to 45
+4s      → Replica sends REPLCONF ACK 45
+...     (heartbeats continue every 1s)
+
+30s     ← OS sends TCP keepalive probe
+        ↳ Master responds (connection alive)
+
+--- Master freezes here (hung process) ---
+
+31s     → Replica sends REPLCONF ACK 45 (no response)
+32s     → Replica sends REPLCONF ACK 45 (no response)
+...     (heartbeats continue, but no data received)
+
+60s     ← OS sends another TCP keepalive probe
+        (Connection still open at TCP level)
+
+65s     ⚠️  Read deadline exceeded!
+        → read() returns: i/o timeout
+        → handleMasterDisconnect() called
+        → Connection closed
+        → Wait 5 seconds...
+
+70s     → Attempt reconnection to master
+```
+
+### Why Multiple Layers?
+
+| Scenario | Detection Method | Time to Detect |
+|----------|-----------------|----------------|
+| Cable unplugged | TCP Keepalive | 30-90s |
+| Master process frozen | Read Deadline | 65s |
+| Master alive but slow | REPLCONF ACK lag | 1s (master detects) |
+| Network partition | Both TCP + Deadline | 65s |
+| Master restarted | Read error | Immediate |
+
+**Result:** No matter what goes wrong, replica detects it and reconnects automatically! 🛡️

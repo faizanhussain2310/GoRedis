@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"fmt"
 	"time"
 )
 
@@ -126,6 +127,77 @@ func (s *Store) TTL(key string) int64 {
 		return -2 // Already expired
 	}
 	return int64(ttl)
+}
+
+// Incr increments the integer value of a key by 1
+// Returns the value after increment or error if value is not an integer
+func (s *Store) Incr(key string) (int64, error) {
+	return s.IncrBy(key, 1)
+}
+
+// IncrBy increments the integer value of a key by the given amount
+// Returns the value after increment or error if value is not an integer
+func (s *Store) IncrBy(key string, increment int64) (int64, error) {
+	val, exists := s.data[key]
+
+	// Check expiration if key exists
+	if exists && val.ExpiresAt != nil && time.Now().After(*val.ExpiresAt) {
+		s.deleteKey(key)
+		exists = false
+	}
+
+	var current int64
+	if exists {
+		// Try to parse existing value as integer
+		switch v := val.Data.(type) {
+		case string:
+			parsed, err := parseInt64(v)
+			if err != nil {
+				return 0, err
+			}
+			current = parsed
+		case int64:
+			current = v
+		case int:
+			current = int64(v)
+		default:
+			return 0, fmt.Errorf("value is not an integer or out of range")
+		}
+	}
+
+	// Perform increment
+	newValue := current + increment
+
+	// Store as string to match Redis behavior
+	s.data[key] = &Value{
+		Data:      fmt.Sprintf("%d", newValue),
+		ExpiresAt: nil,
+		Type:      StringType,
+	}
+
+	return newValue, nil
+}
+
+// Decr decrements the integer value of a key by 1
+// Returns the value after decrement or error if value is not an integer
+func (s *Store) Decr(key string) (int64, error) {
+	return s.IncrBy(key, -1)
+}
+
+// DecrBy decrements the integer value of a key by the given amount
+// Returns the value after decrement or error if value is not an integer
+func (s *Store) DecrBy(key string, decrement int64) (int64, error) {
+	return s.IncrBy(key, -decrement)
+}
+
+// parseInt64 parses a string to int64, matching Redis behavior
+func parseInt64(s string) (int64, error) {
+	var result int64
+	_, err := fmt.Sscanf(s, "%d", &result)
+	if err != nil {
+		return 0, fmt.Errorf("value is not an integer or out of range")
+	}
+	return result, nil
 }
 
 // CleanupExpiredKeys performs active expiration using random sampling

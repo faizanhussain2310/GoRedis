@@ -27,6 +27,7 @@ type ReplicaInfo struct {
 	Writer           *bufio.Writer
 	ID               string
 	Addr             string
+	ListeningPort    int // Port replica is listening on (from REPLCONF)
 	ConnectedAt      time.Time
 	LastPingAt       time.Time
 	Offset           int64 // Replication offset
@@ -291,6 +292,41 @@ func (rm *ReplicationManager) GetReplica(id string) (*ReplicaInfo, bool) {
 	return replica, exists
 }
 
+// GetReplicaByAddr returns a replica by connection address
+func (rm *ReplicationManager) GetReplicaByAddr(addr string) (*ReplicaInfo, bool) {
+	rm.replicasMu.RLock()
+	defer rm.replicasMu.RUnlock()
+
+	for _, replica := range rm.replicas {
+		if replica.Addr == addr {
+			return replica, true
+		}
+	}
+	return nil, false
+}
+
+// UpdateReplicaOffset updates the offset for a replica
+func (rm *ReplicationManager) UpdateReplicaOffset(id string, offset int64) {
+	rm.replicasMu.Lock()
+	defer rm.replicasMu.Unlock()
+
+	if replica, exists := rm.replicas[id]; exists {
+		replica.Offset = offset
+		replica.LastPingAt = time.Now()
+	}
+}
+
+// SetReplicaListeningPort sets the listening port for a replica
+func (rm *ReplicationManager) SetReplicaListeningPort(id string, port int) {
+	rm.replicasMu.Lock()
+	defer rm.replicasMu.Unlock()
+
+	if replica, exists := rm.replicas[id]; exists {
+		replica.ListeningPort = port
+		log.Printf("[REPLICATION] Set listening port %d for replica %s", port, id)
+	}
+}
+
 // GetAllReplicas returns all connected replicas
 func (rm *ReplicationManager) GetAllReplicas() []*ReplicaInfo {
 	rm.replicasMu.RLock()
@@ -422,6 +458,13 @@ func (rm *ReplicationManager) GetInfo() map[string]interface{} {
 		i := 0
 		for _, replica := range rm.replicas {
 			ip, port := parseAddr(replica.Addr)
+
+			// Use the listening port if available (sent via REPLCONF)
+			// Otherwise fall back to the port from the connection address
+			if replica.ListeningPort > 0 {
+				port = replica.ListeningPort
+			}
+
 			slaveInfo := map[string]interface{}{
 				"id":     replica.ID,
 				"ip":     ip,
@@ -446,6 +489,8 @@ func (rm *ReplicationManager) GetInfo() map[string]interface{} {
 			info["master_link_status"] = string(rm.masterInfo.State)
 			info["master_last_io_seconds_ago"] = time.Since(rm.masterInfo.LastInteraction).Seconds()
 			info["master_sync_in_progress"] = rm.masterInfo.State == MasterStateSyncing
+			info["slave_repl_offset"] = rm.masterInfo.Offset
+			info["master_replid"] = rm.masterInfo.MasterReplID
 		}
 		rm.masterInfoMu.RUnlock()
 	}

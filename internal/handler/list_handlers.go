@@ -89,10 +89,7 @@ func (h *CommandHandler) handleLPop(cmd *protocol.Command) []byte {
 	h.processor.Submit(procCmd)
 	result := <-procCmd.Response
 
-	res := result.(struct {
-		Result []string
-		Err    error
-	})
+	res := result.(processor.StringSliceResult)
 
 	if res.Err != nil {
 		return protocol.EncodeError(res.Err.Error())

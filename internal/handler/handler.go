@@ -8,9 +8,11 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"redis/internal/aof"
+	"redis/internal/lua"
 	"redis/internal/processor"
 	"redis/internal/protocol"
 	"redis/internal/replication"
@@ -42,15 +44,16 @@ func DefaultHandlerConfig() HandlerConfig {
 		Pipeline: PipelineConfig{
 			MaxCommands:     1000,
 			SlowThreshold:   10 * time.Millisecond,
-			CommandTimeout:  5 * time.Second,
-			ReadTimeout:     5 * time.Second,
-			PipelineTimeout: 1 * time.Millisecond,
+			CommandTimeout:  30 * time.Second,
+			ReadTimeout:     60 * time.Second,
+			PipelineTimeout: 1 * time.Second,
 		},
 	}
 }
 
 type CommandHandler struct {
 	processor       *processor.Processor
+	store           *storage.Store // Direct access to store for cluster checks
 	readBufferSize  int
 	writeBufferSize int
 	commands        map[string]CommandFunc
@@ -59,14 +62,22 @@ type CommandHandler struct {
 	txManager       *TransactionManager
 	blockingManager *BlockingManager
 	aofWriter       *aof.Writer
-	replicationMgr  interface{} // ReplicationManager interface (avoid circular import)
-	serverPort      int         // Server's listening port
-	onChange        func()      // Callback for tracking changes (for RDB auto-save)
+	replicationMgr  interface{}       // ReplicationManager interface (avoid circular import)
+	serverPort      int               // Server's listening port
+	onChange        func()            // Callback for tracking changes (for RDB auto-save)
+	luaEngine       *lua.ScriptEngine // Lua scripting engine
+	pendingPorts    map[string]int    // Temporary storage for listening ports by connection address
+	pendingPortsMu  sync.RWMutex      // Protects pendingPorts map
 }
 
 func NewCommandHandler(proc *processor.Processor, config HandlerConfig, aofWriter *aof.Writer, replMgr interface{}, serverPort int) *CommandHandler {
+	// Create Lua engine with Redis executor
+	executor := lua.NewRedisExecutor(proc.GetStore())
+	luaEngine := lua.NewScriptEngine(executor)
+
 	h := &CommandHandler{
 		processor:       proc,
+		store:           proc.GetStore(), // Get direct store reference for cluster
 		readBufferSize:  config.ReadBufferSize,
 		writeBufferSize: config.WriteBufferSize,
 		pipelineConfig:  config.Pipeline,
@@ -76,6 +87,8 @@ func NewCommandHandler(proc *processor.Processor, config HandlerConfig, aofWrite
 		aofWriter:       aofWriter,
 		replicationMgr:  replMgr,
 		serverPort:      serverPort,
+		luaEngine:       luaEngine,
+		pendingPorts:    make(map[string]int),
 	}
 	h.registerCommands()
 	return h
@@ -145,14 +158,38 @@ func (h *CommandHandler) registerCommands() {
 	// Bloom Filter commands
 	h.registerBloomCommands()
 
+	// HyperLogLog commands
+	h.registerHyperLogLogCommands()
+
+	// Bitmap commands
+	h.registerBitmapCommands()
+
 	// Pub/Sub commands
 	h.registerPubSubCommands()
 
 	// Transaction commands
 	h.registerTransactionCommands()
 
+	// Cluster commands
+	h.registerClusterCommands()
+
+	// Lua scripting commands
+	h.registerLuaCommands()
+
 	// Admin/Debug commands
 	h.registerAdminCommands()
+}
+
+// registerClusterCommands registers cluster commands
+func (h *CommandHandler) registerClusterCommands() {
+	h.commands["CLUSTER"] = h.handleCluster
+}
+
+// registerLuaCommands registers Lua scripting commands
+func (h *CommandHandler) registerLuaCommands() {
+	h.commands["EVAL"] = h.handleEval
+	h.commands["EVALSHA"] = h.handleEvalSHA
+	h.commands["SCRIPT"] = h.handleScript
 }
 
 // registerAdminCommands registers admin and debug commands
@@ -187,6 +224,10 @@ func (h *CommandHandler) registerStringCommands() {
 	h.commands["COMMAND"] = h.handleCommand
 	h.commands["EXPIRE"] = h.handleExpire
 	h.commands["TTL"] = h.handleTTL
+	h.commands["INCR"] = h.handleIncr
+	h.commands["INCRBY"] = h.handleIncrBy
+	h.commands["DECR"] = h.handleDecr
+	h.commands["DECRBY"] = h.handleDecrBy
 }
 
 // registerListCommands registers all list commands
@@ -280,6 +321,22 @@ func (h *CommandHandler) registerBloomCommands() {
 	h.commands["BF.INFO"] = h.handleBFInfo
 }
 
+// registerHyperLogLogCommands registers all HyperLogLog commands
+func (h *CommandHandler) registerHyperLogLogCommands() {
+	h.commands["PFADD"] = h.handlePFAdd
+	h.commands["PFCOUNT"] = h.handlePFCount
+	h.commands["PFMERGE"] = h.handlePFMerge
+}
+
+// registerBitmapCommands registers all bitmap commands
+func (h *CommandHandler) registerBitmapCommands() {
+	h.commands["SETBIT"] = h.handleSetBit
+	h.commands["GETBIT"] = h.handleGetBit
+	h.commands["BITCOUNT"] = h.handleBitCount
+	h.commands["BITPOS"] = h.handleBitPos
+	h.commands["BITOP"] = h.handleBitOp
+}
+
 // registerPubSubCommands registers all pub/sub commands
 func (h *CommandHandler) registerPubSubCommands() {
 	h.commands["PUBLISH"] = h.handlePublish
@@ -367,6 +424,25 @@ func (h *CommandHandler) ExecuteCommand(cmd *protocol.Command) []byte {
 	return h.executeCommand(cmd)
 }
 
+// ExecuteReplicatedCommand executes a command received from master (via replication)
+// This bypasses the read-only replica check since commands from master should always execute
+func (h *CommandHandler) ExecuteReplicatedCommand(cmd *protocol.Command) []byte {
+	if cmd == nil || len(cmd.Args) == 0 {
+		return protocol.EncodeError("ERR empty command")
+	}
+
+	command := strings.ToUpper(cmd.Args[0])
+
+	// NOTE: We do NOT check isReplica() here - replicated commands must execute
+	// even on replicas since they're coming from the master
+
+	if handler, exists := h.commands[command]; exists {
+		return handler(cmd)
+	}
+
+	return protocol.EncodeError(fmt.Sprintf("ERR unknown command '%s'", command))
+}
+
 // isReplica checks if server is currently running as a replica
 func (h *CommandHandler) isReplica() bool {
 	if h.replicationMgr == nil {
@@ -400,5 +476,5 @@ func (h *CommandHandler) handleReplicationCommand(conn net.Conn, reader *bufio.R
 
 	// Route all replication commands to HandleReplicationCommand in replication_handlers.go
 	// This includes: PING, REPLCONF, PSYNC, INFO, REPLICAOF, SLAVEOF
-	return HandleReplicationCommand(conn, reader, writer, command, args, replMgr)
+	return HandleReplicationCommand(conn, reader, writer, command, args, replMgr, h)
 }

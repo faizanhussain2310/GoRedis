@@ -15,24 +15,31 @@ import (
 
 // ConnectToMaster connects to a master server as a replica
 func (rm *ReplicationManager) ConnectToMaster(host string, port int) error {
-	if rm.role != RoleReplica {
-		return fmt.Errorf("can only connect to master when role is replica")
-	}
-
 	rm.masterInfoMu.Lock()
 	defer rm.masterInfoMu.Unlock()
 
-	// Close existing connection if any
-	if rm.masterInfo != nil && rm.masterInfo.Conn != nil {
-		rm.masterInfo.Conn.Close()
+	// Preserve replication ID and offset from previous connection (for partial resync)
+	var savedReplID string
+	var savedOffset int64
+
+	if rm.masterInfo != nil {
+		savedReplID = rm.masterInfo.MasterReplID
+		savedOffset = rm.masterInfo.Offset
+
+		// Close existing connection if any
+		if rm.masterInfo.Conn != nil {
+			rm.masterInfo.Conn.Close()
+		}
 	}
 
-	// Create new master info
+	// Create new master info, preserving replication state if available
 	rm.masterInfo = &MasterInfo{
 		Host:            host,
 		Port:            port,
 		State:           MasterStateConnecting,
 		LastInteraction: time.Now(),
+		MasterReplID:    savedReplID,
+		Offset:          savedOffset,
 	}
 
 	// Connect to master
@@ -47,7 +54,16 @@ func (rm *ReplicationManager) ConnectToMaster(host string, port int) error {
 	rm.masterInfo.Reader = bufio.NewReader(conn)
 	rm.masterInfo.Writer = bufio.NewWriter(conn)
 
-	log.Printf("[REPLICATION] Connected to master %s", addr)
+	// Enable TCP keepalive for dead connection detection
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	// Change role to replica
+	rm.role = RoleReplica
+
+	log.Printf("[REPLICATION] Connected to master %s, role changed to replica", addr)
 
 	// Start handshake
 	go rm.performHandshake()
@@ -119,8 +135,25 @@ func (rm *ReplicationManager) performHandshake() {
 
 	log.Printf("[REPLICATION] Handshake: REPLCONF capa OK")
 
-	// Step 4: Send PSYNC (full sync first time)
-	cmd = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"
+	// Step 4: Send PSYNC (with replid and offset if we have them)
+	// If we've synced before, try partial resync. Otherwise request full resync.
+	rm.masterInfoMu.Lock()
+	replID := rm.masterInfo.MasterReplID
+	offset := rm.masterInfo.Offset
+	rm.masterInfoMu.Unlock()
+
+	if replID == "" {
+		// First time sync - request full resync
+		cmd = "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"
+		log.Printf("[REPLICATION] Sending PSYNC ? -1 (requesting full resync)")
+	} else {
+		// We have a previous replid - try partial resync
+		offsetStr := fmt.Sprintf("%d", offset)
+		cmd = fmt.Sprintf("*3\r\n$5\r\nPSYNC\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n",
+			len(replID), replID, len(offsetStr), offsetStr)
+		log.Printf("[REPLICATION] Sending PSYNC %s %d (requesting partial resync)", replID, offset)
+	}
+
 	if err := rm.sendToMaster(cmd); err != nil {
 		log.Printf("[REPLICATION] Handshake failed at PSYNC: %v", err)
 		rm.handleMasterDisconnect()
@@ -157,6 +190,9 @@ func (rm *ReplicationManager) performHandshake() {
 
 	// Start receiving replication stream
 	go rm.receiveReplicationStream()
+
+	// Start heartbeat to keep connection alive and sync offset
+	go rm.sendReplicationHeartbeat()
 }
 
 // sendToMaster sends data to master
@@ -212,7 +248,12 @@ func (rm *ReplicationManager) receiveReplicationStream() {
 			break
 		}
 		reader := rm.masterInfo.Reader
+		conn := rm.masterInfo.Conn
 		rm.masterInfoMu.RUnlock()
+
+		// Set read deadline (65s - slightly longer than repl-timeout)
+		// This prevents infinite blocking if master goes silent
+		conn.SetReadDeadline(time.Now().Add(65 * time.Second))
 
 		// Read RESP command
 		line, err := reader.ReadString('\n')
@@ -300,6 +341,26 @@ func (rm *ReplicationManager) receiveReplicationStream() {
 			// Process command
 			log.Printf("[REPLICATION] Received command from master: %v", args)
 
+			// Handle special replication commands
+			if len(args) > 0 {
+				cmdName := strings.ToUpper(args[0])
+
+				// Respond to PING from master to keep connection alive
+				if cmdName == "PING" {
+					rm.sendToMaster("+PONG\r\n")
+					continue
+				}
+
+				// Handle REPLCONF GETACK (master asking for offset)
+				if cmdName == "REPLCONF" && len(args) > 1 && strings.ToUpper(args[1]) == "GETACK" {
+					offset := rm.masterInfo.Offset
+					offsetStr := fmt.Sprintf("%d", offset)
+					resp := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$%d\r\n%s\r\n", len(offsetStr), offsetStr)
+					rm.sendToMaster(resp)
+					continue
+				}
+			}
+
 			// Execute command on local store
 			if err := rm.executeReplicatedCommand(args); err != nil {
 				log.Printf("[REPLICATION] Error executing replicated command %v: %v", args, err)
@@ -320,18 +381,33 @@ func (rm *ReplicationManager) receiveReplicationStream() {
 // handleMasterDisconnect handles disconnection from master
 func (rm *ReplicationManager) handleMasterDisconnect() {
 	rm.masterInfoMu.Lock()
-	defer rm.masterInfoMu.Unlock()
 
-	if rm.masterInfo != nil {
-		if rm.masterInfo.Conn != nil {
-			rm.masterInfo.Conn.Close()
-		}
-		rm.masterInfo.State = MasterStateDisconnected
+	if rm.masterInfo == nil {
+		rm.masterInfoMu.Unlock()
+		return
 	}
+
+	host := rm.masterInfo.Host
+	port := rm.masterInfo.Port
+
+	if rm.masterInfo.Conn != nil {
+		rm.masterInfo.Conn.Close()
+	}
+	rm.masterInfo.State = MasterStateDisconnected
+	rm.masterInfoMu.Unlock()
 
 	log.Printf("[REPLICATION] Disconnected from master")
 
-	// TODO: Implement reconnection logic
+	// Auto-reconnect after 5 seconds
+	go func() {
+		time.Sleep(5 * time.Second)
+
+		log.Printf("[REPLICATION] Attempting to reconnect to master %s:%d", host, port)
+		if err := rm.ConnectToMaster(host, port); err != nil {
+			log.Printf("[REPLICATION] Reconnection failed: %v", err)
+			// Will retry again after next disconnect
+		}
+	}()
 }
 
 // DisconnectFromMaster disconnects from master
@@ -339,11 +415,29 @@ func (rm *ReplicationManager) DisconnectFromMaster() {
 	rm.masterInfoMu.Lock()
 	defer rm.masterInfoMu.Unlock()
 
-	if rm.masterInfo != nil && rm.masterInfo.Conn != nil {
-		rm.masterInfo.Conn.Close()
-		rm.masterInfo = nil
-		log.Printf("[REPLICATION] Manually disconnected from master")
+	if rm.masterInfo != nil {
+		// Preserve replication ID and offset for potential partial resync later
+		savedReplID := rm.masterInfo.MasterReplID
+		savedOffset := rm.masterInfo.Offset
+
+		// Close connection
+		if rm.masterInfo.Conn != nil {
+			rm.masterInfo.Conn.Close()
+		}
+
+		// Reset master info but preserve replication state for future reconnection
+		rm.masterInfo = &MasterInfo{
+			MasterReplID: savedReplID,
+			Offset:       savedOffset,
+			State:        MasterStateDisconnected,
+		}
+
+		log.Printf("[REPLICATION] Manually disconnected from master (preserved replid=%s, offset=%d)", savedReplID, savedOffset)
 	}
+
+	// Change role to master
+	rm.role = RoleMaster
+	log.Printf("[REPLICATION] Role changed to master")
 }
 
 // GetMasterInfo returns master connection info
@@ -352,6 +446,38 @@ func (rm *ReplicationManager) GetMasterInfo() *MasterInfo {
 	defer rm.masterInfoMu.RUnlock()
 
 	return rm.masterInfo
+}
+
+// sendReplicationHeartbeat sends REPLCONF ACK periodically to keep connection alive
+func (rm *ReplicationManager) sendReplicationHeartbeat() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	log.Printf("[REPLICATION] Starting heartbeat sender")
+
+	for range ticker.C {
+		// Check if still connected
+		rm.masterInfoMu.RLock()
+		if rm.masterInfo == nil || rm.masterInfo.Conn == nil || rm.masterInfo.State != MasterStateConnected {
+			rm.masterInfoMu.RUnlock()
+			log.Printf("[REPLICATION] Stopping heartbeat - not connected")
+			return
+		}
+		offset := rm.masterInfo.Offset
+		rm.masterInfoMu.RUnlock()
+
+		// Send REPLCONF ACK <offset>
+		offsetStr := fmt.Sprintf("%d", offset)
+		cmd := fmt.Sprintf("*3\r\n$8\r\nREPLCONF\r\n$3\r\nACK\r\n$%d\r\n%s\r\n", len(offsetStr), offsetStr)
+
+		if err := rm.sendToMaster(cmd); err != nil {
+			log.Printf("[REPLICATION] Failed to send heartbeat: %v", err)
+			rm.handleMasterDisconnect()
+			return
+		}
+
+		// Note: We don't wait for response from REPLCONF ACK - master doesn't reply
+	}
 }
 
 // loadRDBIntoStore loads an RDB file into the store by executing commands

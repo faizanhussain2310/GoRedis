@@ -44,7 +44,7 @@ func handlePing(writer *bufio.Writer, args []string) {
 }
 
 // handleReplConf handles REPLCONF command (replication configuration)
-func handleReplConf(writer *bufio.Writer, args []string) {
+func handleReplConf(conn net.Conn, writer *bufio.Writer, args []string, rm *replication.ReplicationManager, handler interface{}) {
 	if len(args) < 2 {
 		writeError(writer, "ERR wrong number of arguments for 'replconf' command")
 		return
@@ -62,6 +62,15 @@ func handleReplConf(writer *bufio.Writer, args []string) {
 		}
 
 		log.Printf("[REPLICATION] Replica listening on port %d", port)
+
+		// Store temporarily - will be applied when replica is added during PSYNC
+		if h, ok := handler.(*CommandHandler); ok {
+			h.pendingPortsMu.Lock()
+			h.pendingPorts[conn.RemoteAddr().String()] = port
+			h.pendingPortsMu.Unlock()
+			log.Printf("[REPLICATION] Stored pending port %d for %s", port, conn.RemoteAddr().String())
+		}
+
 		writeSimpleString(writer, "OK")
 
 	case "capa":
@@ -83,9 +92,19 @@ func handleReplConf(writer *bufio.Writer, args []string) {
 			return
 		}
 
-		// offset, _ := strconv.ParseInt(args[1], 10, 64)
-		// TODO: Update replica's offset
-		writeSimpleString(writer, "OK")
+		offset, err := strconv.ParseInt(args[1], 10, 64)
+		if err != nil {
+			writeError(writer, "ERR invalid offset")
+			return
+		}
+
+		// Find replica by connection address and update offset
+		if replica, ok := rm.GetReplicaByAddr(conn.RemoteAddr().String()); ok {
+			rm.UpdateReplicaOffset(replica.ID, offset)
+			log.Printf("[REPLICATION] Replica %s ACK offset: %d", replica.ID, offset)
+		}
+
+		// Note: Master doesn't send a response to REPLCONF ACK (it's one-way)
 
 	default:
 		writeError(writer, fmt.Sprintf("ERR unknown REPLCONF option '%s'", option))
@@ -93,7 +112,7 @@ func handleReplConf(writer *bufio.Writer, args []string) {
 }
 
 // handlePSync handles PSYNC command (partial/full synchronization)
-func handlePSync(conn net.Conn, writer *bufio.Writer, args []string, rm *replication.ReplicationManager) {
+func handlePSync(conn net.Conn, writer *bufio.Writer, args []string, rm *replication.ReplicationManager, handler interface{}) {
 	if len(args) != 2 {
 		writeError(writer, "ERR wrong number of arguments for 'psync' command")
 		return
@@ -155,6 +174,17 @@ func handlePSync(conn net.Conn, writer *bufio.Writer, args []string, rm *replica
 	// Add replica to replication manager
 	replica := rm.AddReplica(conn, replicaID)
 
+	// Apply pending listening port if available
+	if h, ok := handler.(*CommandHandler); ok {
+		h.pendingPortsMu.Lock()
+		if port, exists := h.pendingPorts[conn.RemoteAddr().String()]; exists {
+			rm.SetReplicaListeningPort(replica.ID, port)
+			delete(h.pendingPorts, conn.RemoteAddr().String())
+			log.Printf("[REPLICATION] Applied pending port %d to replica %s", port, replica.ID)
+		}
+		h.pendingPortsMu.Unlock()
+	}
+
 	// Send RDB snapshot with actual data
 	rdbData := generateRDB(rm)
 	writer.WriteString(fmt.Sprintf("$%d\r\n", len(rdbData)))
@@ -208,6 +238,9 @@ func handleInfo(writer *bufio.Writer, args []string, rm *replication.Replication
 			response.WriteString(fmt.Sprintf("master_port:%d\r\n", info["master_port"]))
 			response.WriteString(fmt.Sprintf("master_link_status:%s\r\n", info["master_link_status"]))
 			response.WriteString(fmt.Sprintf("slave_repl_offset:%d\r\n", info["slave_repl_offset"]))
+			if replid, ok := info["master_replid"].(string); ok && replid != "" {
+				response.WriteString(fmt.Sprintf("master_replid:%s\r\n", replid))
+			}
 		}
 	}
 
@@ -456,7 +489,7 @@ func writeInteger(writer *bufio.Writer, n int64) {
 // This is the single entry point for all replication-related commands
 // Returns true if the command was handled
 func HandleReplicationCommand(conn net.Conn, reader *bufio.Reader, writer *bufio.Writer,
-	cmd string, args []string, rm *replication.ReplicationManager) bool {
+	cmd string, args []string, rm *replication.ReplicationManager, handler interface{}) bool {
 
 	switch strings.ToUpper(cmd) {
 	case "PING":
@@ -466,12 +499,12 @@ func HandleReplicationCommand(conn net.Conn, reader *bufio.Reader, writer *bufio
 
 	case "REPLCONF":
 		// Replication configuration (listening-port, capa, getack, ack)
-		handleReplConf(writer, args)
+		handleReplConf(conn, writer, args, rm, handler)
 		return true
 
 	case "PSYNC":
 		// Full/partial synchronization (needs raw connection for RDB streaming)
-		handlePSync(conn, writer, args, rm)
+		handlePSync(conn, writer, args, rm, handler)
 		return true
 
 	case "INFO":

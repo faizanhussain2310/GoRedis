@@ -16,4 +16,8 @@ var (
 	ErrWrongNumArgs        = errors.New("ERR wrong number of arguments for 'hset' command")
 	ErrHashValueNotInteger = errors.New("ERR hash value is not an integer")
 	ErrHashValueNotFloat   = errors.New("ERR hash value is not a float")
+
+	// HyperLogLog errors
+	ErrPrecisionMismatch    = errors.New("HyperLogLog precision mismatch")
+	ErrInvalidRegisterCount = errors.New("invalid register count")
 )

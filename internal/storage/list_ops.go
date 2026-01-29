@@ -2,6 +2,7 @@ package storage
 
 import (
 	"time"
+	"log"
 )
 
 // ==================== LIST OPERATIONS ====================
@@ -130,11 +131,14 @@ func (s *Store) LPop(key string, count int) ([]string, error) {
 	}
 
 	result := make([]string, 0, count)
+	log.Println("count = ", count)
 	for i := 0; i < count; i++ {
 		if val, ok := list.PopFront(); ok {
 			result = append(result, val)
+			log.Println("val = ", val)
 		}
 	}
+	log.Println("result = ", result)
 
 	s.saveList(key, list)
 	return result, nil

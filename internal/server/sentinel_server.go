@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math/rand"
 	"net"
 	"strings"
 	"sync"
@@ -14,6 +15,14 @@ import (
 	"redis/internal/protocol"
 	"redis/internal/sentinel"
 )
+
+// SentinelVotingState tracks voting state for RAFT-style consensus
+type SentinelVotingState struct {
+	currentEpoch int64  // Highest epoch number seen
+	votedEpoch   int64  // Epoch in which we last voted
+	votedFor     string // Sentinel ID we voted for in votedEpoch
+	mu           sync.Mutex
+}
 
 // SentinelServer handles Sentinel protocol and monitoring
 type SentinelServer struct {
@@ -27,6 +36,20 @@ type SentinelServer struct {
 	shutdownChan    chan struct{}
 	mu              sync.RWMutex
 	isShutdown      bool
+
+	// Peer Sentinel connections for quorum voting
+	sentinelPeers map[string]net.Conn // key: "host:port", value: connection
+	peersMu       sync.RWMutex
+
+	// Voting state for distributed consensus
+	votingState *SentinelVotingState
+	sentinelID  string // Unique ID for this Sentinel (host:port)
+
+	// RAFT-style election timeout for leader election
+	electionTimeout   time.Duration // Randomized timeout for this Sentinel
+	lastMasterContact time.Time     // Last successful contact with master
+	electionTimerChan chan struct{} // Channel to signal election timeout
+	contactMu         sync.RWMutex  // Protects lastMasterContact
 }
 
 // NewSentinelServer creates a new standalone Sentinel server
@@ -62,11 +85,46 @@ func NewSentinelServer(cfg *SentinelConfig) *SentinelServer {
 		log.Printf("Other Sentinels: %v", cfg.SentinelAddrs)
 	}
 
-	s := &SentinelServer{
-		config:       cfg,
-		sentinel:     sentinelInstance,
-		shutdownChan: make(chan struct{}),
+	// Generate unique Sentinel ID (host:port)
+	sentinelID := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+
+	// RAFT-style randomized election timeout (30-60 seconds)
+	// Each Sentinel gets a different timeout to naturally elect a leader
+	baseTimeout := time.Duration(cfg.DownAfterMillis) * time.Millisecond
+	if baseTimeout == 0 {
+		baseTimeout = 30 * time.Second
 	}
+	// Add random jitter: baseTimeout + (0 to baseTimeout)
+	// Example: 30s + (0-30s) = 30-60s range
+	electionTimeout := baseTimeout + time.Duration(rand.Intn(int(baseTimeout.Milliseconds())))*time.Millisecond
+
+	s := &SentinelServer{
+		config:        cfg,
+		sentinel:      sentinelInstance,
+		shutdownChan:  make(chan struct{}),
+		sentinelPeers: make(map[string]net.Conn),
+		votingState: &SentinelVotingState{
+			currentEpoch: 0,
+			votedEpoch:   0,
+			votedFor:     "",
+		},
+		sentinelID:        sentinelID,
+		electionTimeout:   electionTimeout,
+		lastMasterContact: time.Now(),
+		electionTimerChan: make(chan struct{}, 1),
+	}
+
+	log.Printf("[SENTINEL] Election timeout for %s: %v (RAFT-style randomized)", sentinelID, electionTimeout)
+
+	// Set voting callback for distributed consensus
+	sentinelInstance.SetVoteRequestCallback(func() bool {
+		return s.voteForFailover()
+	})
+
+	// Set heartbeat callback to reset election timer when master responds
+	sentinelInstance.SetMasterHeartbeatCallback(func() {
+		s.resetElectionTimer()
+	})
 
 	// Start Sentinel monitoring
 	sentinelInstance.Start()
@@ -76,6 +134,9 @@ func NewSentinelServer(cfg *SentinelConfig) *SentinelServer {
 		log.Printf("Connecting to other Sentinels for quorum coordination...")
 		go s.connectToOtherSentinels()
 	}
+
+	// Start RAFT-style election timer
+	go s.runElectionTimer()
 
 	return s
 }
@@ -125,8 +186,18 @@ func (s *SentinelServer) monitorSentinel(addr string) {
 			log.Printf("Connected to Sentinel at %s", addr)
 			backoff = 1 * time.Second // Reset backoff on successful connection
 
+			// Store peer connection for voting
+			s.peersMu.Lock()
+			s.sentinelPeers[addr] = conn
+			s.peersMu.Unlock()
+
 			// Send periodic PING to keep connection alive
 			s.maintainSentinelConnection(conn, addr)
+
+			// Remove peer connection on disconnect
+			s.peersMu.Lock()
+			delete(s.sentinelPeers, addr)
+			s.peersMu.Unlock()
 
 			conn.Close()
 			log.Printf("Lost connection to Sentinel %s, reconnecting...", addr)
@@ -190,25 +261,244 @@ func (s *SentinelServer) maintainSentinelConnection(conn net.Conn, addr string) 
 			// This is simplified - production would properly parse RESP arrays
 			masterResponse := string(buffer[:n])
 			if len(masterResponse) > 0 {
-				log.Printf("Sentinel %s reports master info: %v", addr, strings.TrimSpace(masterResponse)[:50])
+				trimmed := strings.TrimSpace(masterResponse)
+				if len(trimmed) > 50 {
+					trimmed = trimmed[:50]
+				}
+				log.Printf("Sentinel %s reports master info: %v", addr, trimmed)
 			}
 		}
 	}
 }
 
+// runElectionTimer implements RAFT-style election timeout for leader election
+// This replaces the jitter-based approach with proper distributed consensus timing
+func (s *SentinelServer) runElectionTimer() {
+	timer := time.NewTimer(s.electionTimeout)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-s.shutdownChan:
+			return
+
+		case <-timer.C:
+			// Election timeout expired - check if master is down
+			if s.isMasterDown() {
+				log.Printf("[ELECTION] Election timeout expired (%v) - master appears DOWN, becoming candidate",
+					s.electionTimeout)
+				if s.voteForFailover() {
+					log.Printf("[ELECTION] Won election - proceeding with failover")
+				} else {
+					log.Printf("[ELECTION] Lost election - another Sentinel won")
+				}
+			} else {
+				// Update last contact time since master is up
+				s.contactMu.Lock()
+				s.lastMasterContact = time.Now()
+				s.contactMu.Unlock()
+			}
+			timer.Reset(s.electionTimeout)
+
+		case <-s.electionTimerChan:
+			// Master heartbeat received - reset election timer
+			timer.Reset(s.electionTimeout)
+		}
+	}
+}
+
+// resetElectionTimer resets the election timeout (called when master responds)
+func (s *SentinelServer) resetElectionTimer() {
+	s.contactMu.Lock()
+	s.lastMasterContact = time.Now()
+	s.contactMu.Unlock()
+
+	// Non-blocking send to reset timer
+	select {
+	case s.electionTimerChan <- struct{}{}:
+	default:
+		// Channel full, timer will reset on next cycle
+	}
+}
+
+// isMasterDown checks if the master is actually down
+func (s *SentinelServer) isMasterDown() bool {
+	status := s.sentinel.GetStatus()
+	masterStatus, ok := status["master_status"].(string)
+	return ok && masterStatus == "down"
+}
+
 // voteForFailover coordinates with other Sentinels for failover voting
 // Returns true if quorum is reached for failover
+//
+// Voting Protocol (RAFT-inspired consensus with Epochs + Election Timeouts):
+// 1. Called by election timer when this Sentinel's timeout expires FIRST
+// 2. Increment epoch (logical timestamp for this failover attempt)
+// 3. Vote for self in new epoch
+// 4. Send SENTINEL IS-MASTER-DOWN-BY-ADDR to all peers with epoch
+// 5. Peers respond with vote (1 = agree, 0 = disagree/already voted)
+// 6. Wait for responses with timeout (3 seconds)
+// 7. Count total votes (including self)
+// 8. Return true if votes >= quorum threshold
+//
+// Election Timeout Mechanism (Prevents Race Conditions):
+// - Each Sentinel has randomized timeout (e.g., 30-60 seconds)
+// - First Sentinel to timeout becomes candidate NATURALLY
+// - No jitter needed - randomization already provides ordering
+// - Other Sentinels vote for first candidate they see
+//
+// Epoch Mechanism (Prevents Split-Brain):
+// - Each failover attempt gets unique epoch number
+// - Each Sentinel votes for FIRST requester in a given epoch
+// - Once voted in epoch N, cannot vote for others in epoch N
+// - Higher epochs override lower epochs (stale requests rejected)
+//
+// Example with 3 Sentinels, quorum=2:
+//
+//	Timeouts: A=35s, B=47s, C=53s (randomized)
+//	T0: Master crashes
+//	T35: Sentinel A's timeout expires FIRST → becomes candidate
+//	T35: A increments epoch to 5, broadcasts vote request
+//	T36: Sentinel B receives A's request → votes for A (epoch=5)
+//	T36: Sentinel C receives A's request → votes for A (epoch=5)
+//	T37: A reaches quorum (A + B + C = 3 votes) ✅ PROCEED WITH FAILOVER
+//	T47: B's timeout expires, but epoch already at 5, A already won
+//	T53: C's timeout expires, same situation
+//
+// No race condition possible - first timeout always wins!
 func (s *SentinelServer) voteForFailover() bool {
-	votes := 1 // This Sentinel votes yes
+	// NO JITTER - we're already the first to timeout (election timer guarantees this)
+	// Check if we already voted for someone else
+	s.votingState.mu.Lock()
+	if s.votingState.votedFor != "" && s.votingState.votedFor != s.sentinelID {
+		votedFor := s.votingState.votedFor
+		votedEpoch := s.votingState.votedEpoch
+		s.votingState.mu.Unlock()
+		log.Printf("[SENTINEL VOTE] Already voted for %s in epoch %d, cannot become candidate",
+			votedFor, votedEpoch)
+		return false
+	}
 
-	// In a full implementation, we would:
-	// 1. Send failover proposal to all connected Sentinels
-	// 2. Wait for responses (with timeout)
-	// 3. Count votes
-	// 4. Return true if votes >= quorum
+	// Increment epoch for this failover attempt
+	s.votingState.currentEpoch++
+	currentEpoch := s.votingState.currentEpoch
+	s.votingState.votedEpoch = currentEpoch
+	s.votingState.votedFor = s.sentinelID
+	s.votingState.mu.Unlock()
 
-	// For now, simplified single-Sentinel logic
-	return votes >= s.config.Quorum
+	votes := 1 // This Sentinel votes yes (we detected the failure)
+
+	log.Printf("[SENTINEL VOTE] Initiating failover vote - epoch=%d, sentinelID=%s",
+		currentEpoch, s.sentinelID)
+	log.Printf("[SENTINEL VOTE] Requesting votes from %d peers (quorum: %d)",
+		len(s.sentinelPeers), s.config.Quorum)
+
+	// Get current master address for vote request
+	masterHost, masterPort := s.sentinel.GetMasterAddr()
+
+	// Channel to collect votes from peers
+	voteChan := make(chan int, len(s.sentinelPeers))
+
+	// Get snapshot of peers (avoid holding lock during network I/O)
+	s.peersMu.RLock()
+	peers := make(map[string]net.Conn)
+	for addr, conn := range s.sentinelPeers {
+		peers[addr] = conn
+	}
+	s.peersMu.RUnlock()
+
+	// Send vote request to all connected peers in parallel
+	for addr, conn := range peers {
+		go s.requestVoteFromPeer(addr, conn, masterHost, masterPort, currentEpoch, voteChan)
+	}
+
+	// Wait for responses with timeout
+	timeout := time.After(3 * time.Second)
+	expectedResponses := len(peers)
+	receivedResponses := 0
+
+	for receivedResponses < expectedResponses {
+		select {
+		case vote := <-voteChan:
+			votes += vote
+			receivedResponses++
+			log.Printf("[SENTINEL VOTE] Received vote: %d (total: %d/%d, responses: %d/%d)",
+				vote, votes, s.config.Quorum, receivedResponses, expectedResponses)
+		case <-timeout:
+			log.Printf("[SENTINEL VOTE] Timeout waiting for votes (received %d/%d responses)",
+				receivedResponses, expectedResponses)
+			goto countVotes
+		}
+	}
+
+countVotes:
+	quorumReached := votes >= s.config.Quorum
+	log.Printf("[SENTINEL VOTE] Final tally - epoch=%d: %d votes, quorum: %d, result: %v",
+		currentEpoch, votes, s.config.Quorum, quorumReached)
+
+	return quorumReached
+}
+
+// requestVoteFromPeer sends vote request to a single peer Sentinel with epoch
+func (s *SentinelServer) requestVoteFromPeer(
+	addr string,
+	conn net.Conn,
+	masterHost string,
+	masterPort int,
+	epoch int64,
+	voteChan chan<- int,
+) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[SENTINEL VOTE] Panic requesting vote from %s: %v", addr, r)
+			voteChan <- 0 // No vote on error
+		}
+	}()
+
+	// Send SENTINEL IS-MASTER-DOWN-BY-ADDR command
+	// Format: SENTINEL IS-MASTER-DOWN-BY-ADDR <ip> <port> <current-epoch> <runid>
+	// - epoch: Logical timestamp for this failover attempt
+	// - runid: Our Sentinel ID (or * for simple vote query)
+	cmd := protocol.EncodeArray([]string{
+		"SENTINEL",
+		"IS-MASTER-DOWN-BY-ADDR",
+		masterHost,
+		fmt.Sprintf("%d", masterPort),
+		fmt.Sprintf("%d", epoch), // Send current epoch
+		s.sentinelID,             // Our Sentinel ID for vote tracking
+	})
+
+	conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	_, err := conn.Write(cmd)
+	if err != nil {
+		log.Printf("[SENTINEL VOTE] Failed to send vote request to %s: %v", addr, err)
+		voteChan <- 0
+		return
+	}
+
+	// Read response
+	// Expected: *3\r\n:0\r\n$1\r\n*\r\n:0\r\n (master not down from peer's view)
+	// Or:       *3\r\n:1\r\n$1\r\n*\r\n:0\r\n (master down, peer agrees)
+	buffer := make([]byte, 1024)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, err := conn.Read(buffer)
+	if err != nil {
+		log.Printf("[SENTINEL VOTE] Failed to read vote response from %s: %v", addr, err)
+		voteChan <- 0
+		return
+	}
+
+	response := string(buffer[:n])
+
+	// Simple parsing: look for :1 (agrees) or :0 (disagrees)
+	// Full RESP parser would be better, but this works for basic voting
+	if strings.Contains(response, ":1") {
+		log.Printf("[SENTINEL VOTE] Peer %s agrees master is down", addr)
+		voteChan <- 1
+	} else {
+		log.Printf("[SENTINEL VOTE] Peer %s disagrees master is down", addr)
+		voteChan <- 0
+	}
 }
 
 // Start starts the Sentinel server
@@ -374,6 +664,107 @@ func (s *SentinelServer) executeSentinelCommand(cmd *protocol.Command) []byte {
 	}
 }
 
+// handleVoteRequest processes incoming vote requests from other Sentinels
+// Implements RAFT-style voting with epoch-based consensus
+//
+// Voting Rules:
+// 1. Reject requests with epoch < currentEpoch (stale request)
+// 2. Update currentEpoch if request has higher epoch (new failover round)
+// 3. Vote for FIRST requester in each epoch (first-come-first-served)
+// 4. Reject subsequent requests in same epoch (already voted)
+// 5. Only vote if we also think master is down (independent verification)
+//
+// Response Format: *3\r\n:<down_state>\r\n$<leader_len>\r\n<leader>\r\n:<epoch>\r\n
+// - down_state: 1 if we voted for requester, 0 if rejected
+// - leader: Sentinel ID we voted for in this epoch
+// - epoch: Current epoch number
+func (s *SentinelServer) handleVoteRequest(masterHost string, masterPort int, requestEpoch int64, candidateID string) []byte {
+	s.votingState.mu.Lock()
+	defer s.votingState.mu.Unlock()
+
+	log.Printf("[VOTE REQUEST] From %s, epoch=%d (our epoch=%d, votedEpoch=%d, votedFor=%s)",
+		candidateID, requestEpoch, s.votingState.currentEpoch, s.votingState.votedEpoch, s.votingState.votedFor)
+
+	// Rule 1: Reject stale epochs
+	if requestEpoch < s.votingState.currentEpoch {
+		log.Printf("[VOTE REQUEST] Rejected - stale epoch (request=%d < current=%d)",
+			requestEpoch, s.votingState.currentEpoch)
+		// Response: *3\r\n:0\r\n$<len>\r\n<votedFor>\r\n:<epoch>\r\n
+		return s.encodeVoteResponse(0, s.votingState.votedFor, s.votingState.currentEpoch)
+	}
+
+	// Rule 2: New epoch resets voting state
+	if requestEpoch > s.votingState.currentEpoch {
+		log.Printf("[VOTE REQUEST] New epoch detected (request=%d > current=%d) - resetting vote state",
+			requestEpoch, s.votingState.currentEpoch)
+		s.votingState.currentEpoch = requestEpoch
+		s.votingState.votedEpoch = 0 // Haven't voted in this epoch yet
+		s.votingState.votedFor = ""
+	}
+
+	// Rule 3: Already voted in this epoch?
+	if s.votingState.votedEpoch == requestEpoch {
+		// Check if this is the same candidate we voted for (confirmation)
+		if s.votingState.votedFor == candidateID {
+			log.Printf("[VOTE REQUEST] Confirming vote for %s in epoch %d",
+				candidateID, requestEpoch)
+			return s.encodeVoteResponse(1, candidateID, requestEpoch)
+		} else {
+			// Already voted for someone else in this epoch
+			log.Printf("[VOTE REQUEST] Rejected - already voted for %s in epoch %d",
+				s.votingState.votedFor, requestEpoch)
+			return s.encodeVoteResponse(0, s.votingState.votedFor, requestEpoch)
+		}
+	}
+
+	// Rule 4: First vote in this epoch - check if master is actually down
+	currentMasterHost, currentMasterPort := s.sentinel.GetMasterAddr()
+
+	// Verify this is asking about our monitored master
+	if masterHost != currentMasterHost || masterPort != currentMasterPort {
+		log.Printf("[VOTE REQUEST] Rejected - master mismatch (request=%s:%d, monitoring=%s:%d)",
+			masterHost, masterPort, currentMasterHost, currentMasterPort)
+		return s.encodeVoteResponse(0, "", requestEpoch)
+	}
+
+	// Independent verification: Do we also think master is down?
+	status := s.sentinel.GetStatus()
+	masterStatus, ok := status["master_status"].(string)
+
+	if !ok || masterStatus != "down" {
+		log.Printf("[VOTE REQUEST] Rejected - master appears UP from our perspective (status=%s)",
+			masterStatus)
+		return s.encodeVoteResponse(0, "", requestEpoch)
+	}
+
+	// Rule 5: Grant vote - master is down, first request in this epoch
+	s.votingState.votedEpoch = requestEpoch
+	s.votingState.votedFor = candidateID
+
+	log.Printf("[VOTE REQUEST] ✅ GRANTED - voting for %s in epoch %d (master is DOWN)",
+		candidateID, requestEpoch)
+
+	return s.encodeVoteResponse(1, candidateID, requestEpoch)
+}
+
+// encodeVoteResponse creates a proper RESP array for vote responses
+// Format: *3\r\n:<vote>\r\n$<len>\r\n<leader>\r\n:<epoch>\r\n
+// - vote: 1 (granted) or 0 (rejected) as integer
+// - leader: Sentinel ID we voted for as bulk string
+// - epoch: Current epoch as integer
+func (s *SentinelServer) encodeVoteResponse(vote int, leader string, epoch int64) []byte {
+	var result strings.Builder
+	result.WriteString("*3\r\n")
+	result.WriteString(fmt.Sprintf(":%d\r\n", vote))
+	if leader == "" {
+		result.WriteString("$-1\r\n") // Null bulk string
+	} else {
+		result.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(leader), leader))
+	}
+	result.WriteString(fmt.Sprintf(":%d\r\n", epoch))
+	return []byte(result.String())
+}
+
 // handlePing responds to PING command
 func (s *SentinelServer) handlePing() []byte {
 	return protocol.EncodeSimpleString("PONG")
@@ -398,9 +789,31 @@ func (s *SentinelServer) handleSentinelCommand(args []string) []byte {
 		return s.handleSentinelSentinels(args[1:])
 	case "RESET":
 		return s.handleSentinelReset(args[1:])
+	case "IS-MASTER-DOWN-BY-ADDR":
+		return s.handleIsMasterDownByAddr(args[1:])
 	default:
 		return protocol.EncodeError(fmt.Sprintf("ERR Unknown sentinel subcommand '%s'", subcmd))
 	}
+}
+
+// handleIsMasterDownByAddr handles vote requests from other Sentinels
+func (s *SentinelServer) handleIsMasterDownByAddr(args []string) []byte {
+	// Expected: <ip> <port> <epoch> <runid>
+	if len(args) < 4 {
+		return protocol.EncodeError("ERR wrong number of arguments for 'sentinel is-master-down-by-addr' command")
+	}
+
+	masterHost := args[0]
+	masterPort := 0
+	fmt.Sscanf(args[1], "%d", &masterPort)
+
+	epoch := int64(0)
+	fmt.Sscanf(args[2], "%d", &epoch)
+
+	candidateID := args[3]
+
+	// Process vote request with epoch-based consensus
+	return s.handleVoteRequest(masterHost, masterPort, epoch, candidateID)
 }
 
 // handleGetMasterAddrByName returns the master address

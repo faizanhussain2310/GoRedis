@@ -298,3 +298,13 @@ func EncodeInterfaceArray(items []interface{}) []byte {
 	}
 	return []byte(result)
 }
+
+// EncodeIntegerArray encodes an array of integers
+// Used for commands like SCRIPT EXISTS that return multiple integer values
+func EncodeIntegerArray(items []int) []byte {
+	result := fmt.Sprintf("*%d\r\n", len(items))
+	for _, item := range items {
+		result += fmt.Sprintf(":%d\r\n", item)
+	}
+	return []byte(result)
+}

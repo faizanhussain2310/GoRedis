@@ -32,6 +32,7 @@ const (
 	TypeZSet        = 3
 	TypeHash        = 4
 	TypeBloomFilter = 5
+	TypeHyperLogLog = 6
 	TypeListQuick   = 14
 )
 
@@ -177,14 +178,39 @@ func (w *Writer) writeKeyToWriter(writer io.Writer, key string, value *storage.V
 		}
 
 	case storage.SetType:
-		if set, ok := value.Data.(map[string]struct{}); ok {
+		if setStruct, ok := value.Data.(*storage.Set); ok && setStruct != nil {
 			writer.Write([]byte{TypeSet})
 			w.writeStringToWriter(writer, key)
-			w.writeLengthToWriter(writer, len(set))
-			for member := range set {
+			w.writeLengthToWriter(writer, len(setStruct.Members))
+			for member := range setStruct.Members {
 				w.writeStringToWriter(writer, member)
 			}
 		}
+
+	case storage.ZSetType:
+		if zsetStruct, ok := value.Data.(*storage.ZSet); ok && zsetStruct != nil {
+			members := zsetStruct.GetAll()
+			writer.Write([]byte{TypeZSet})
+			w.writeStringToWriter(writer, key)
+			w.writeLengthToWriter(writer, len(members))
+			for _, member := range members {
+				w.writeStringToWriter(writer, member.Member)
+				// Write score as 8-byte float64
+				binary.Write(writer, binary.LittleEndian, member.Score)
+			}
+		}
+
+	case storage.BloomFilterType:
+		// BloomFilter serialization not yet implemented in RDB format
+		// Would require exporting internal bit array and metadata
+		// For now, skip in RDB snapshots (similar to AOF behavior)
+		// TODO: Implement BF.DUMP/BF.RESTORE commands for persistence
+
+	case storage.HyperLogLogType:
+		// HyperLogLog serialization not yet implemented in RDB format
+		// Would require exporting internal registers array
+		// For now, skip in RDB snapshots (similar to AOF behavior)
+		// TODO: Implement PFDUMP/PFRESTORE or raw register export
 	}
 
 	return nil

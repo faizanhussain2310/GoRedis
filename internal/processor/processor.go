@@ -20,6 +20,10 @@ const (
 	CmdCleanup
 	CmdExpire
 	CmdTTL
+	CmdIncr
+	CmdIncrBy
+	CmdDecr
+	CmdDecrBy
 	CmdSnapshot     // For AOF rewrite (returns [][]string commands)
 	CmdDataSnapshot // For RDB snapshots (returns map[string]*Value)
 	// List commands
@@ -93,6 +97,16 @@ const (
 	CmdBFExists
 	CmdBFMExists
 	CmdBFInfo
+	// HyperLogLog commands
+	CmdPFAdd
+	CmdPFCount
+	CmdPFMerge
+	// Bitmap commands
+	CmdSetBit
+	CmdGetBit
+	CmdBitCount
+	CmdBitPos
+	CmdBitOp
 	// Pub/Sub commands
 	CmdPublish
 	CmdPubSubChannels
@@ -229,6 +243,12 @@ func (p *Processor) registerExecutors() {
 	// Bloom Filter commands
 	p.registerBloomExecutors()
 
+	// HyperLogLog commands
+	p.registerHyperLogLogExecutors()
+
+	// Bitmap commands
+	p.registerBitmapExecutors()
+
 	// Pub/Sub commands
 	p.registerPubSubExecutors()
 
@@ -242,6 +262,7 @@ func (p *Processor) registerStringExecutors() {
 	stringCmds := []CommandType{
 		CmdSet, CmdGet, CmdDelete, CmdExists,
 		CmdKeys, CmdFlush, CmdCleanup, CmdExpire, CmdTTL,
+		CmdIncr, CmdIncrBy, CmdDecr, CmdDecrBy,
 	}
 	for _, cmdType := range stringCmds {
 		p.executors[cmdType] = p.executeStringCommand
@@ -315,6 +336,26 @@ func (p *Processor) registerBloomExecutors() {
 	}
 	for _, cmdType := range bloomCmds {
 		p.executors[cmdType] = p.executeBloomCommand
+	}
+}
+
+// registerHyperLogLogExecutors registers HyperLogLog command executors
+func (p *Processor) registerHyperLogLogExecutors() {
+	hllCmds := []CommandType{
+		CmdPFAdd, CmdPFCount, CmdPFMerge,
+	}
+	for _, cmdType := range hllCmds {
+		p.executors[cmdType] = p.executeHyperLogLogCommand
+	}
+}
+
+// registerBitmapExecutors registers bitmap command executors
+func (p *Processor) registerBitmapExecutors() {
+	bitmapCmds := []CommandType{
+		CmdSetBit, CmdGetBit, CmdBitCount, CmdBitPos, CmdBitOp,
+	}
+	for _, cmdType := range bitmapCmds {
+		p.executors[cmdType] = p.executeBitmapCommand
 	}
 }
 

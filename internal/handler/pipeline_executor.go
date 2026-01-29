@@ -182,6 +182,16 @@ func (h *CommandHandler) executeWithTimeout(ctx context.Context, cmd *protocol.C
 
 	start := time.Now()
 
+	// Check if replica is trying to execute write command (for direct client writes)
+	if h.isReplica() && IsWriteCommand(command) {
+		return PipelineResult{
+			Response: protocol.EncodeError("READONLY You can't write against a read only replica"),
+			Duration: time.Since(start),
+			Command:  command,
+			Args:     cmd.Args[1:],
+		}
+	}
+
 	// Execute command in channel to support timeout
 	resultChan := make(chan []byte, 1)
 	go func() {
@@ -245,6 +255,16 @@ func (h *CommandHandler) executeWithTimeoutNoAOF(ctx context.Context, cmd *proto
 	defer cancel()
 
 	start := time.Now()
+
+	// Check if replica is trying to execute write command (for direct client writes)
+	if h.isReplica() && IsWriteCommand(command) {
+		return PipelineResult{
+			Response: protocol.EncodeError("READONLY You can't write against a read only replica"),
+			Duration: time.Since(start),
+			Command:  command,
+			Args:     cmd.Args[1:],
+		}
+	}
 
 	// Execute command in channel to support timeout
 	resultChan := make(chan []byte, 1)

@@ -7,6 +7,7 @@ import (
 
 	"redis/internal/protocol"
 	"redis/internal/rdb"
+	"redis/internal/storage"
 )
 
 // handleBGRewriteAOF triggers AOF rewrite in the background
@@ -61,7 +62,23 @@ func (h *CommandHandler) handleBGRewriteAOF(cmd *protocol.Command) []byte {
 						}
 					}
 
-				case 4: // HashType
+				case 2: // SetType
+					// Access the Set struct and its Members map
+					if setStruct, ok := value.Data.(*storage.Set); ok && setStruct != nil && len(setStruct.Members) > 0 {
+						setCmd := []string{"SADD", key}
+						for member := range setStruct.Members {
+							setCmd = append(setCmd, member)
+						}
+						commands = append(commands, setCmd)
+						if value.ExpiresAt != nil {
+							ttl := int(time.Until(*value.ExpiresAt).Seconds())
+							if ttl > 0 {
+								commands = append(commands, []string{"EXPIRE", key, fmt.Sprintf("%d", ttl)})
+							}
+						}
+					}
+
+				case 3: // HashType
 					if hash, ok := value.Data.(map[string]string); ok && len(hash) > 0 {
 						hashCmd := []string{"HSET", key}
 						for field, val := range hash {
@@ -76,20 +93,36 @@ func (h *CommandHandler) handleBGRewriteAOF(cmd *protocol.Command) []byte {
 						}
 					}
 
-				case 2: // SetType
-					if set, ok := value.Data.(map[string]struct{}); ok && len(set) > 0 {
-						setCmd := []string{"SADD", key}
-						for member := range set {
-							setCmd = append(setCmd, member)
-						}
-						commands = append(commands, setCmd)
-						if value.ExpiresAt != nil {
-							ttl := int(time.Until(*value.ExpiresAt).Seconds())
-							if ttl > 0 {
-								commands = append(commands, []string{"EXPIRE", key, fmt.Sprintf("%d", ttl)})
+				case 4: // ZSetType
+					// Access the ZSet struct and get all members with scores
+					if zsetStruct, ok := value.Data.(*storage.ZSet); ok && zsetStruct != nil && zsetStruct.Len() > 0 {
+						members := zsetStruct.GetAll()
+						if len(members) > 0 {
+							zsetCmd := []string{"ZADD", key}
+							for _, member := range members {
+								zsetCmd = append(zsetCmd, fmt.Sprintf("%f", member.Score), member.Member)
+							}
+							commands = append(commands, zsetCmd)
+							if value.ExpiresAt != nil {
+								ttl := int(time.Until(*value.ExpiresAt).Seconds())
+								if ttl > 0 {
+									commands = append(commands, []string{"EXPIRE", key, fmt.Sprintf("%d", ttl)})
+								}
 							}
 						}
 					}
+
+				case 5: // BloomFilterType
+					// Bloom filters require special handling - they can't be reconstructed from members
+					// Skip in AOF as they're probabilistic structures that should be rebuilt
+					// Alternative: could implement BF.RESERVE + BF.DUMP/BF.RESTORE commands
+					log.Printf("Skipping BloomFilter key '%s' in AOF (not supported in AOF rewrite)", key)
+
+				case 6: // HyperLogLogType
+					// HyperLogLog also requires special handling - it's a cardinality estimator
+					// Skip in AOF as it can't be reconstructed from individual elements
+					// Alternative: could implement PFMERGE or raw register export
+					log.Printf("Skipping HyperLogLog key '%s' in AOF (not supported in AOF rewrite)", key)
 				}
 			}
 

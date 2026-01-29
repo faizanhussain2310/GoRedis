@@ -75,11 +75,16 @@ func (h *CommandHandler) HandlePipeline(ctx context.Context, client *Client, con
 			return
 		default:
 			// Set read deadline for the first command (blocks until client sends something)
-			readTimeout := config.ReadTimeout
-			if readTimeout <= 0 {
-				readTimeout = 30 * time.Second // Default idle timeout
+			// In pub/sub mode, no timeout - clients wait indefinitely for messages
+			if client.InPubSub {
+				client.Conn.SetReadDeadline(time.Time{}) // No timeout
+			} else {
+				readTimeout := config.ReadTimeout
+				if readTimeout <= 0 {
+					readTimeout = 30 * time.Second // Default idle timeout
+				}
+				client.Conn.SetReadDeadline(time.Now().Add(readTimeout))
 			}
-			client.Conn.SetReadDeadline(time.Now().Add(readTimeout))
 
 			// Wait for first command (this blocks - waiting for client to initiate)
 			cmd, err := protocol.ParseCommand(reader)
@@ -129,6 +134,25 @@ func (h *CommandHandler) HandlePipeline(ctx context.Context, client *Client, con
 			}
 			commandsInBatch++
 
+			// In pub/sub mode, after processing the subscription command,
+			// enter a special loop that only handles pub/sub commands
+			if client.InPubSub {
+				// Flush the subscription confirmation
+				if err := writer.Flush(); err != nil {
+					log.Printf("Error flushing response: %v", err)
+					return
+				}
+
+				// Enter pub/sub mode - only handle SUBSCRIBE/UNSUBSCRIBE/PING/QUIT
+				// This returns when client exits pub/sub or disconnects
+				if !h.HandlePubSubMode(ctx, client, reader, writer, config, tx, &consecutiveSlowCommands, maxConsecutiveSlow, slowLog) {
+					// Error or disconnect - exit pipeline
+					return
+				}
+				// Client exited pub/sub mode cleanly - continue with normal commands
+				continue
+			}
+
 			// Process remaining pipelined commands
 			// Use short timeout to wait for more data that might be in-flight
 			for commandsInBatch < config.MaxCommands {
@@ -166,7 +190,10 @@ func (h *CommandHandler) HandlePipeline(ctx context.Context, client *Client, con
 
 				// No complete command in buffer - wait briefly for more data
 				// This catches data that's in-flight on the network
-				client.Conn.SetReadDeadline(time.Now().Add(pipelineTimeout))
+				// In pub/sub mode, no timeout (wait indefinitely)
+				if !client.InPubSub {
+					client.Conn.SetReadDeadline(time.Now().Add(pipelineTimeout))
+				}
 
 				// Try to read more data (will timeout quickly if nothing coming)
 				cmd, err := protocol.ParseCommand(reader)
@@ -258,4 +285,65 @@ func (h *CommandHandler) handleCommandResult(
 	}
 
 	return false
+}
+
+// HandlePubSubMode handles client in pub/sub mode
+// Only allows SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PING, QUIT
+// Returns true if client exited pub/sub cleanly, false if error/disconnect
+func (h *CommandHandler) HandlePubSubMode(
+	ctx context.Context,
+	client *Client,
+	reader *bufio.Reader,
+	writer *bufio.Writer,
+	config PipelineConfig,
+	tx *Transaction,
+	consecutiveSlowCommands *int,
+	maxConsecutiveSlow int,
+	slowLog *SlowLog,
+) bool {
+	for {
+		select {
+		case <-ctx.Done():
+			return false // Context canceled
+		default:
+			// No timeout in pub/sub mode - wait indefinitely for commands
+			client.Conn.SetReadDeadline(time.Time{})
+
+			// Wait for command from client
+			cmd, err := protocol.ParseCommand(reader)
+			if err != nil {
+				if err == io.EOF {
+					return false // Client disconnected
+				}
+				log.Printf("Error reading command in pub/sub mode: %v", err)
+				return false // Error
+			}
+
+			// Execute the command
+			result := h.executeWithTransaction(ctx, client, cmd, tx, config.CommandTimeout)
+
+			// Check if client exited pub/sub mode
+			if !client.InPubSub {
+				// Client unsubscribed from all channels, exit pub/sub mode
+				writer.Write(result.Response)
+				writer.Flush()
+				return true // Exited cleanly, continue in normal mode
+			}
+
+			// Write response
+			if h.handleCommandResult(result, consecutiveSlowCommands, maxConsecutiveSlow, slowLog, client, writer) {
+				return false // Client should be disconnected
+			}
+			if _, err := writer.Write(result.Response); err != nil {
+				log.Printf("Client %d: write error: %v", client.ID, err)
+				return false // Write error
+			}
+
+			// Flush immediately in pub/sub mode
+			if err := writer.Flush(); err != nil {
+				log.Printf("Error flushing response: %v", err)
+				return false // Flush error
+			}
+		}
+	}
 }
