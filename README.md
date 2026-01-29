@@ -301,8 +301,14 @@ make clean
 
 ### Use with Go Client
 
-Use the official [go-redis](https://github.com/redis/go-redis) client library:
+This server is fully compatible with standard Redis clients. Here's how to connect using the official [go-redis](https://github.com/redis/go-redis) library.
 
+**First, start your Redis server:**
+```bash
+./bin/redis-server --port 6379
+```
+
+**Install the go-redis client:**
 ```bash
 go get github.com/redis/go-redis/v9
 ```
@@ -320,7 +326,7 @@ import (
 func main() {
     ctx := context.Background()
     
-    // Connect to standalone server
+    // Connect to your Redis server running on localhost:6379
     client := redis.NewClient(&redis.Options{
         Addr: "localhost:6379",
     })
@@ -342,6 +348,13 @@ func main() {
 ```
 
 **Sentinel connection (automatic failover):**
+
+First, start your HA setup:
+```bash
+make run-ha  # Starts master + replicas + 3 sentinels
+```
+
+Then connect via Sentinel:
 ```go
 package main
 
@@ -396,41 +409,6 @@ func main() {
 
 ---
 
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-### Development Setup
-
-```bash
-# Clone the repo
-git clone https://github.com/yourusername/redis-go.git
-cd redis-go
-
-# Install dependencies
-make deps
-
-# Run tests
-make test
-
-# Format code
-make fmt
-
-# Run linter
-make lint
-```
-
-### Roadmap
-
-- [ ] Cluster mode support
-- [ ] Streams data structure
-- [ ] TLS/SSL encryption
-- [ ] ACL authentication
-- [ ] Modules API
-- [ ] Redis Graph support
-
----
-
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
@@ -446,9 +424,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Support
 
-- 📧 Email: your.email@example.com
-- 🐛 Issues: [GitHub Issues](https://github.com/yourusername/redis-go/issues)
-- 💬 Discussions: [GitHub Discussions](https://github.com/yourusername/redis-go/discussions)
+- 📧 Email: faizanhussain2310@example.com
+- 🐛 Issues: [GitHub Issues](https://github.com/faizanhussain2310/redis-go/issues)
+- 💬 Discussions: [GitHub Discussions](https://github.com/faizanhussain2310/redis-go/discussions)
 
 ---
 
@@ -505,17 +483,6 @@ Options:
   --sentinel-addrs string    Comma-separated peer Sentinels
 ```
 
-### Runtime Configuration
-
-```bash
-# Change configuration at runtime
-redis-cli CONFIG SET maxmemory 100mb
-redis-cli CONFIG GET maxmemory
-
-# Persist configuration
-redis-cli CONFIG REWRITE
-```
-
 ---
 
 ## 🏗️ Make Targets
@@ -529,10 +496,6 @@ make run-standalone     # Run single server (port 6379)
 make run-replication    # Run master + 2 replicas
 make run-ha             # Run full HA setup (master + replicas + sentinels)
 
-make test               # Run tests
-make fmt                # Format code
-make vet                # Run go vet
-make lint               # Run linter
 make clean              # Clean all artifacts and stop processes
 make help               # Show all targets
 ```
