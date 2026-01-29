@@ -426,7 +426,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - 📧 Email: faizanhussain2310@example.com
 - 🐛 Issues: [GitHub Issues](https://github.com/faizanhussain2310/GoRedis/issues)
-- 💬 Discussions: [GitHub Discussions](https://github.com/faizanhussain2310/GoRedis/discussions)
 
 ---
 
