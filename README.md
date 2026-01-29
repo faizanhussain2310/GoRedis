@@ -425,8 +425,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## 📞 Support
 
 - 📧 Email: faizanhussain2310@example.com
-- 🐛 Issues: [GitHub Issues](https://github.com/faizanhussain2310/redis-go/issues)
-- 💬 Discussions: [GitHub Discussions](https://github.com/faizanhussain2310/redis-go/discussions)
+- 🐛 Issues: [GitHub Issues](https://github.com/faizanhussain2310/GoRedis/issues)
+- 💬 Discussions: [GitHub Discussions](https://github.com/faizanhussain2310/GoRedis/discussions)
 
 ---
 
