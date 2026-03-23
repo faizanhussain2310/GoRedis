@@ -52,6 +52,30 @@ func (r *RedisExecutor) ExecuteCommand(cmdName string, args ...interface{}) (int
 		r.store.Set(stringArgs[0], stringArgs[1], nil)
 		return "OK", nil
 
+	case "SETEX":
+		if len(stringArgs) < 3 {
+			return nil, fmt.Errorf("ERR wrong number of arguments for 'setex' command")
+		}
+		seconds, err := strconv.ParseInt(stringArgs[1], 10, 64)
+		if err != nil || seconds <= 0 {
+			return nil, fmt.Errorf("ERR invalid expire time in 'setex' command")
+		}
+		expiryTime := time.Now().Add(time.Duration(seconds) * time.Second)
+		r.store.Set(stringArgs[0], stringArgs[2], &expiryTime)
+		return "OK", nil
+
+	case "PSETEX":
+		if len(stringArgs) < 3 {
+			return nil, fmt.Errorf("ERR wrong number of arguments for 'psetex' command")
+		}
+		ms, err := strconv.ParseInt(stringArgs[1], 10, 64)
+		if err != nil || ms <= 0 {
+			return nil, fmt.Errorf("ERR invalid expire time in 'psetex' command")
+		}
+		expiryTime := time.Now().Add(time.Duration(ms) * time.Millisecond)
+		r.store.Set(stringArgs[0], stringArgs[2], &expiryTime)
+		return "OK", nil
+
 	case "DEL":
 		if len(stringArgs) < 1 {
 			return nil, fmt.Errorf("ERR wrong number of arguments for 'del' command")
