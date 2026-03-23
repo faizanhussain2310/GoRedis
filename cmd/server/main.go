@@ -38,7 +38,7 @@ func main() {
 		SlowLogThreshold:    10 * time.Millisecond, // 10 milliseconds
 		CommandTimeout:      30 * time.Second,      // 30 seconds
 		ReadTimeout:         60 * time.Second,      // 60 seconds
-		PipelineTimeout:     1 * time.Second,       // 1 second
+		PipelineTimeout:     5 * time.Millisecond,  // 5ms - short wait for in-flight pipelined commands
 
 		// AOF configuration
 		AOF: aof.Config{
